@@ -3,5 +3,6 @@ pandas==3.0.2
 requests==2.33.1
 python-dotenv==1.2.2
 pandas-ta-classic==0.4.47
-asyncpg
-redis
+matplotlib==3.10.9
+asyncpg==0.31.0
+redis==7.4.0
