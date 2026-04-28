@@ -7,7 +7,7 @@ import io
 import statistics
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -258,6 +258,14 @@ class FortressScanner:
     """Fortress Scanner with Postgres + Redis trade memory."""
 
     def __init__(self) -> None:
+        self._async_loop = asyncio.new_event_loop()
+        self._async_thread = threading.Thread(
+            target=self._run_loop_forever,
+            args=(self._async_loop,),
+            daemon=True,
+        )
+        self._async_thread.start()
+
         self.scan_interval_seconds = 120
         self.max_symbols = 35
         self.alert_cooldown_seconds = 60 * 60
@@ -266,7 +274,7 @@ class FortressScanner:
         self.db_path = "signals_log.db"
         self.db_executor = ThreadPoolExecutor(max_workers=1)
 
-        self.last_daily_report_date = datetime.utcnow().date()
+        self.last_daily_report_date = datetime.now(UTC).date()
         self.il_tz = ZoneInfo("Asia/Jerusalem")
         self.last_daily_report_sent_date_il: Optional[str] = None
         self.min_score_threshold = 6
@@ -290,7 +298,7 @@ class FortressScanner:
             os.getenv("CMC_API_KEY", "").strip() or os.getenv("COINMARKETCAP_API_KEY", "").strip()
         )
         self.daily_flow = {
-            "date": datetime.utcnow().strftime("%Y-%m-%d"),
+            "date": datetime.now(UTC).strftime("%Y-%m-%d"),
             "chat_sent": 0,
             "vip_plus_sent": 0,
         }
@@ -347,6 +355,11 @@ class FortressScanner:
     # -------------------------
     # 0) Local Learning-State (SQLite)
     # -------------------------
+    @staticmethod
+    def _run_loop_forever(loop: asyncio.AbstractEventLoop) -> None:
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+
     def init_db(self) -> None:
         def _create() -> None:
             with sqlite3.connect(self.db_path) as conn:
@@ -384,7 +397,7 @@ class FortressScanner:
         )
 
     def save_learning_state(self) -> None:
-        updated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        updated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
 
         def _save() -> None:
             with sqlite3.connect(self.db_path) as conn:
@@ -1336,14 +1349,8 @@ class FortressScanner:
         }
 
     def _run_async_task(self, coro):
-        try:
-            return asyncio.run(coro)
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            try:
-                return loop.run_until_complete(coro)
-            finally:
-                loop.close()
+        future = asyncio.run_coroutine_threadsafe(coro, self._async_loop)
+        return future.result()
 
     async def _async_fetch_ohlcv(self, ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int) -> Optional[pd.DataFrame]:
         try:
@@ -2354,7 +2361,7 @@ class FortressScanner:
         self.send_telegram(exchange_name, symbol, setup)
 
     def _refresh_daily_flow_state(self) -> None:
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
         if self.daily_flow.get("date") != today:
             self.daily_flow = {"date": today, "chat_sent": 0, "vip_plus_sent": 0}
 
