@@ -1,0 +1,7 @@
+ccxt==4.5.50
+pandas==3.0.2
+requests==2.33.1
+python-dotenv==1.2.2
+pandas-ta-classic==0.4.47
+asyncpg
+redis
