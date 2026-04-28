@@ -42,7 +42,8 @@ class TradeManager:
         self.pg_database = os.getenv("POSTGRES_DB", "trading_db")
         self.redis_url = (
             os.getenv("REDIS_URL")
-            or os.getenv("Redis_URL")
+            or os.getenv("REDIS_PRIVATE_URL")
+            or os.getenv("REDIS_PUBLIC_URL")
             or "redis://localhost:6379/0"
         )
         self.pool: Optional[asyncpg.Pool] = None
@@ -72,6 +73,8 @@ class TradeManager:
         async with self.pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
         print("PostgreSQL Connected")
+        if os.getenv("REDIS_URL"):
+            print(f"DEBUG: Connecting to Redis using URL: {os.getenv('REDIS_URL')[:20]}...")
         self.redis = redis_async.from_url(self.redis_url, decode_responses=True)
         assert self.redis is not None
         await self.redis.ping()
