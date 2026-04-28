@@ -31,7 +31,10 @@ class TradeManager:
     """Async Postgres + Redis trade persistence layer."""
 
     def __init__(self) -> None:
-        self.db_url = os.getenv("DB_URL", "").strip()
+        self.db_url = (
+            os.getenv("DATABASE_URL", "").strip()
+            or os.getenv("DB_URL", "").strip()
+        )
         self.pg_host = os.getenv("POSTGRES_HOST", "localhost")
         self.pg_port = int(os.getenv("POSTGRES_PORT", "5432"))
         self.pg_user = os.getenv("POSTGRES_USER", "fortress")
@@ -46,6 +49,8 @@ class TradeManager:
         self.redis: Optional[redis_async.Redis] = None
 
     async def startup(self) -> List[dict]:
+        if os.getenv("DATABASE_URL"):
+            print(f"DEBUG: Connecting to DB using URL: {os.getenv('DATABASE_URL')[:20]}...")
         if self.db_url:
             self.pool = await asyncpg.create_pool(
                 dsn=self.db_url,
