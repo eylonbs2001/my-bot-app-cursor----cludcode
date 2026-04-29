@@ -1,0 +1,259 @@
+import argparse
+import asyncio
+import os
+from datetime import UTC, datetime
+
+import asyncpg
+import requests
+from dotenv import load_dotenv
+
+
+def mdv2_code(value: str) -> str:
+    text = str(value).replace("\\", "\\\\").replace("`", "\\`")
+    return f"`{text}`"
+
+
+def esc_mdv2(value: str) -> str:
+    escape_chars = r"_*[]()~`>#+-=|{}.!"
+    out = []
+    for ch in str(value):
+        if ch in escape_chars:
+            out.append("\\")
+        out.append(ch)
+    return "".join(out)
+
+
+def format_elapsed(ts: datetime, now: datetime | None = None) -> str:
+    ref = now or datetime.now(UTC)
+    sec = max(0, int((ref - ts).total_seconds()))
+    days = sec // 86400
+    hours = (sec % 86400) // 3600
+    minutes = (sec % 3600) // 60
+    if days > 0:
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+async def open_db() -> asyncpg.Connection:
+    db_url = (os.getenv("DATABASE_URL") or os.getenv("DB_URL") or "").strip()
+    if db_url:
+        return await asyncpg.connect(dsn=db_url)
+    return await asyncpg.connect(
+        host=os.getenv("POSTGRES_HOST", "localhost"),
+        port=int(os.getenv("POSTGRES_PORT", "5432")),
+        user=os.getenv("POSTGRES_USER", "fortress"),
+        password=os.getenv("POSTGRES_PASSWORD", "fortress"),
+        database=os.getenv("POSTGRES_DB", "trading_db"),
+    )
+
+
+def send_message(token: str, payload: dict) -> requests.Response:
+    return requests.post(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        json=payload,
+        timeout=20,
+    )
+
+
+async def main(keep_row: bool) -> int:
+    load_dotenv(dotenv_path=".env")
+
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or "").strip()
+    vip_chat_id = (os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID") or "").strip()
+    vip_plus_chat_id = (os.getenv("VIP_PLUS_CHAT_ID") or "").strip()
+    if not token:
+        print("[FAIL] Missing TELEGRAM_BOT_TOKEN/TELEGRAM_TOKEN")
+        return 1
+    if not vip_chat_id or not vip_plus_chat_id:
+        print("[FAIL] Missing TELEGRAM_CHAT_ID/CHAT_ID or VIP_PLUS_CHAT_ID")
+        return 1
+
+    conn = await open_db()
+    inserted_id = None
+    try:
+        print("[0/5] Ensuring DB schema for simulation...")
+        await conn.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS original_message_id BIGINT")
+        await conn.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS original_chat_id TEXT")
+        await conn.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS chat_id TEXT")
+        await conn.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS last_target_hit INTEGER NOT NULL DEFAULT 0")
+        print("  -> schema check/migration complete")
+
+        print("[1/5] Creating fake trade row in DB...")
+        inserted = await conn.fetchrow(
+            """
+            INSERT INTO signals (
+                exchange, symbol, side, entry_price, stop_loss, tp1, tp2, tp3, score, status, last_target_hit
+            )
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            RETURNING id, timestamp
+            """,
+            "SIMULATION",
+            "TESTBTC/USDT",
+            "LONG",
+            68450.50,
+            67800.00,
+            69200.00,
+            69850.00,
+            70400.00,
+            9,
+            "Pending",
+            0,
+        )
+        inserted_id = int(inserted["id"])
+        signal_ts = inserted["timestamp"]
+        print(f"  -> created signal id={inserted_id} timestamp={signal_ts}")
+
+        print("[2/5] Sending fake ELITE signal to both groups...")
+        signal_text = (
+            "⚡️🚨 *ELITE SIGNAL* 🚨⚡️\n\n"
+            f"*{mdv2_code('TESTBTC/USDT')}*\n"
+            f"Position: *{mdv2_code('LONG')}* 📈\n"
+            f"Leverage: *{mdv2_code('x10')}*\n"
+            "━━━━━━━━━━━━━━\n"
+            f"📥 *Entry:* {mdv2_code('$68,450.50')}\n"
+            f"🛑 *Stop Loss:* {mdv2_code('$67,800.00')} \\({mdv2_code('0.95%')}\\)\n"
+            "━━━━━━━━━━━━━━\n"
+            "*Targets*\n"
+            f"🎯 T1: {mdv2_code('$69,200.00')}\n"
+            f"🎯 T2: {mdv2_code('$69,850.00')}\n"
+            f"🎯 T3: {mdv2_code('$70,400.00')}\n"
+        )
+        res_vip = send_message(
+            token,
+            {"chat_id": vip_chat_id, "text": signal_text, "parse_mode": "MarkdownV2"},
+        )
+        res_vip_plus = send_message(
+            token,
+            {"chat_id": vip_plus_chat_id, "text": signal_text, "parse_mode": "MarkdownV2"},
+        )
+        print(f"  -> VIP send status={res_vip.status_code} ok={res_vip.ok}")
+        print(f"  -> VIP+ send status={res_vip_plus.status_code} ok={res_vip_plus.ok}")
+        if (not res_vip.ok) or (not res_vip_plus.ok):
+            print("  -> send errors:", res_vip.text, res_vip_plus.text)
+            return 1
+
+        vip_message_id = int(res_vip.json()["result"]["message_id"])
+        vip_plus_message_id = int(res_vip_plus.json()["result"]["message_id"])
+        print(f"  -> captured message_ids VIP={vip_message_id}, VIP+={vip_plus_message_id}")
+
+        # Track original message in DB (simulate production capture)
+        await conn.execute(
+            """
+            UPDATE signals
+            SET original_message_id = $1,
+                original_chat_id = $2,
+                chat_id = $2
+            WHERE id = $3
+            """,
+            vip_chat_id and vip_message_id,
+            vip_chat_id,
+            inserted_id,
+        )
+        print("  -> DB updated with original_message_id/chat_id for reply logic")
+
+        print("[3/5] Triggering fake Target Hit (T1) and sending reply...")
+        elapsed = format_elapsed(signal_ts if signal_ts.tzinfo else signal_ts.replace(tzinfo=UTC))
+        target_text = (
+            f"🎯 *{esc_mdv2('TESTBTC/USDT')} TARGET 1 HIT\\!* 📈\n"
+            "━━━━━━━━━━━━━━\n"
+            f"💰 *Profit:* {mdv2_code('+2.35')}% \\(with {esc_mdv2('x10')}\\)\n"
+            f"⏳ *Time Elapsed:* {mdv2_code(elapsed)}\n"
+            f"📥 *Original Entry:* {mdv2_code('$68,450.50')}\n"
+            "━━━━━━━━━━━━━━\n"
+            "✅ *Status:* Goal 1 reached successfully\\."
+        )
+        t1_vip = send_message(
+            token,
+            {
+                "chat_id": vip_chat_id,
+                "text": target_text,
+                "parse_mode": "MarkdownV2",
+                "reply_to_message_id": vip_message_id,
+                "allow_sending_without_reply": True,
+            },
+        )
+        t1_vip_plus = send_message(
+            token,
+            {
+                "chat_id": vip_plus_chat_id,
+                "text": target_text,
+                "parse_mode": "MarkdownV2",
+                "reply_to_message_id": vip_plus_message_id,
+                "allow_sending_without_reply": True,
+            },
+        )
+        print(f"  -> VIP T1 reply status={t1_vip.status_code} ok={t1_vip.ok}")
+        print(f"  -> VIP+ T1 reply status={t1_vip_plus.status_code} ok={t1_vip_plus.ok}")
+        if (not t1_vip.ok) or (not t1_vip_plus.ok):
+            print("  -> reply errors:", t1_vip.text, t1_vip_plus.text)
+            return 1
+
+        await conn.execute(
+            "UPDATE signals SET last_target_hit = 1, status = 'T1_DONE' WHERE id = $1",
+            inserted_id,
+        )
+        print("  -> DB updated: last_target_hit=1, status='T1_DONE'")
+
+        print("[4/5] Building and sending Daily Summary to both groups...")
+        daily_rows = await conn.fetch(
+            """
+            SELECT symbol, entry_price, status, COALESCE(last_target_hit, 0) AS last_target_hit
+            FROM signals
+            WHERE (timestamp AT TIME ZONE 'UTC')::date = (NOW() AT TIME ZONE 'UTC')::date
+            ORDER BY id DESC
+            LIMIT 20
+            """
+        )
+        lines = []
+        hits = 0
+        missed = 0
+        for row in daily_rows:
+            symbol = str(row["symbol"]).replace("/USDT", "")
+            price = float(row["entry_price"])
+            # synthetic 1h change for simulation visibility
+            change = "+2.35%" if int(row["last_target_hit"]) >= 1 else "-0.80%"
+            emoji = "✅" if int(row["last_target_hit"]) >= 1 else "❌"
+            lines.append(f"{symbol} | {price:.3f} | {change} {emoji}")
+            if emoji == "✅":
+                hits += 1
+            else:
+                missed += 1
+        total = hits + missed
+        win_rate = (hits / total * 100.0) if total else 0.0
+        summary_text = (
+            "📊 <b>DAILY SUMMARY</b>\n"
+            f"<b>{datetime.now(UTC).strftime('%Y-%m-%d')} (SIMULATION)</b>\n"
+            "<pre>"
+            + "\n".join(lines)
+            + "\n</pre>\n"
+            "Summary:\n"
+            f"✅ Hits: {hits}\n"
+            f"❌ Missed: {missed}\n"
+            f"💰 Win Rate: {win_rate:.2f}%"
+        )
+        ds_vip = send_message(token, {"chat_id": vip_chat_id, "text": summary_text, "parse_mode": "HTML"})
+        ds_vip_plus = send_message(token, {"chat_id": vip_plus_chat_id, "text": summary_text, "parse_mode": "HTML"})
+        print(f"  -> VIP summary status={ds_vip.status_code} ok={ds_vip.ok}")
+        print(f"  -> VIP+ summary status={ds_vip_plus.status_code} ok={ds_vip_plus.ok}")
+        if (not ds_vip.ok) or (not ds_vip_plus.ok):
+            print("  -> summary errors:", ds_vip.text, ds_vip_plus.text)
+            return 1
+
+        print("[5/5] Simulation completed successfully.")
+        if keep_row:
+            print(f"  -> keeping test row in DB (id={inserted_id})")
+        else:
+            await conn.execute("DELETE FROM signals WHERE id = $1", inserted_id)
+            print(f"  -> cleaned test row from DB (id={inserted_id})")
+        return 0
+    finally:
+        await conn.close()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Production test simulation for signal/target/daily summary flow.")
+    parser.add_argument("--keep-row", action="store_true", help="Keep inserted simulation row in DB.")
+    args = parser.parse_args()
+    raise SystemExit(asyncio.run(main(keep_row=args.keep_row)))

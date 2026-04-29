@@ -1,0 +1,63 @@
+# FalconEye Crypto Signals - production stack for Hetzner CX22
+#
+# Architecture:
+#   - bot      → the FortressScanner Python service (built from Dockerfile)
+#   - redis    → local Redis 7 in a docker container, only reachable from bot
+#   - Postgres → REMOTE on Railway, addressed via DATABASE_URL in .env
+#
+# Bring up with:
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Secrets:
+#   Place all sensitive env vars in a /opt/falconeye/.env file on the host.
+#   This file MUST NOT be committed to git (.gitignore covers it).
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: falcon-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # No ports exposed to the host — only accessible within the docker network.
+    networks:
+      - falcon_net
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: falconeye-scanner:latest
+    container_name: falcon-bot
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Override the Redis URL to point at the local docker service —
+      # this overrides whatever the .env file says, ensuring we never
+      # accidentally reach for an external Redis.
+      REDIS_URL: "redis://redis:6379/0"
+      TZ: "Asia/Jerusalem"
+    networks:
+      - falcon_net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+volumes:
+  redis_data:
+
+networks:
+  falcon_net:
+    driver: bridge
