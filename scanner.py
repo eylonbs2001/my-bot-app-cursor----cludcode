@@ -732,7 +732,9 @@ class FortressScanner:
             self.admin_thread = threading.Thread(target=self.admin_interface_loop, daemon=True)
             self.admin_thread.start()
         except Exception as exc:
-            self.send_admin_notification(f"Startup failure: {exc}", loud=True)
+            self._notify_if_infra_error(exc, "startup")
+            if not self._infra_component_from_error(str(exc)):
+                self.send_admin_notification(f"Startup failure: {exc}", loud=True)
             raise
 
     # -------------------------
@@ -1451,7 +1453,9 @@ class FortressScanner:
                 self.adaptive_learning_step()
             except Exception as exc:
                 print(f"[DB] status watcher error: {exc}")
-                self.send_admin_notification(f"Status watcher error: {exc}", loud=True)
+                self._notify_if_infra_error(exc, "status_watcher_loop")
+                if not self._infra_component_from_error(str(exc)):
+                    self.send_admin_notification(f"Status watcher error: {exc}", loud=True)
             time.sleep(300)
 
     def fetch_signals_for_day(self, day_utc: str) -> List[tuple]:
@@ -1603,7 +1607,9 @@ class FortressScanner:
                         self.last_daily_report_sent_date_utc = report_day
             except Exception as exc:
                 print(f"[REPORT] loop error: {exc}")
-                self.send_admin_notification(f"Daily/heartbeat loop error: {exc}", loud=True)
+                self._notify_if_infra_error(exc, "daily_report_loop")
+                if not self._infra_component_from_error(str(exc)):
+                    self.send_admin_notification(f"Daily/heartbeat loop error: {exc}", loud=True)
             time.sleep(60)
 
     # -------------------------
@@ -3787,7 +3793,9 @@ class FortressScanner:
                 self.run_cycle()
             except Exception as exc:
                 print(f"[FATAL] cycle error: {exc}")
-                self.send_admin_notification(f"FATAL cycle error: {exc}", loud=True)
+                self._notify_if_infra_error(exc, "run_forever")
+                if not self._infra_component_from_error(str(exc)):
+                    self.send_admin_notification(f"FATAL cycle error: {exc}", loud=True)
             print(f"Sleeping {self.scan_interval_seconds}s...\n")
             time.sleep(self.scan_interval_seconds)
 
