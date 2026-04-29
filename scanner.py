@@ -1598,6 +1598,47 @@ class FortressScanner:
             print(f"[{exchange_name}] tracking {len(symbols)} high-volume USDT pairs")
             return symbols
         except Exception as exc:
+            # If auth keys are invalid or restricted, retry once with public market-data client.
+            err_text = str(exc)
+            auth_hint = any(
+                hint in err_text.lower()
+                for hint in ["invalid api-key", "api-key", "authentication", "permission", "auth"]
+            )
+            if auth_hint:
+                try:
+                    public_factory = {
+                        "Binance": ccxt.binance,
+                        "Bybit": ccxt.bybit,
+                        "OKX": ccxt.okx,
+                    }.get(exchange_name)
+                    if public_factory:
+                        public_ex = public_factory({"enableRateLimit": True})
+                        tickers = public_ex.fetch_tickers()
+                        ranked: List[Tuple[str, float]] = []
+                        fallback_symbols: List[str] = []
+                        for symbol, info in tickers.items():
+                            if not symbol.endswith("/USDT"):
+                                continue
+                            if ":" in symbol:
+                                continue
+                            quote_volume = info.get("quoteVolume") or 0
+                            base_volume = info.get("baseVolume") or 0
+                            last_price = info.get("last") or info.get("close") or 0
+                            est_quote_vol = float(base_volume) * float(last_price) if base_volume and last_price else 0
+                            resolved_vol = float(quote_volume) if quote_volume and float(quote_volume) > 0 else est_quote_vol
+                            if resolved_vol > 0:
+                                ranked.append((symbol, resolved_vol))
+                            else:
+                                fallback_symbols.append(symbol)
+                        ranked.sort(key=lambda x: x[1], reverse=True)
+                        symbols = [s for s, _ in ranked[: self.max_symbols]]
+                        if len(symbols) < self.max_symbols and fallback_symbols:
+                            needed = self.max_symbols - len(symbols)
+                            symbols.extend(fallback_symbols[:needed])
+                        print(f"[{exchange_name}] auth fallback -> public feed, tracking {len(symbols)} high-volume USDT pairs")
+                        return symbols
+                except Exception as fallback_exc:
+                    print(f"[{exchange_name}] public fallback failed: {fallback_exc}")
             print(f"[{exchange_name}] failed to fetch top symbols: {exc}")
             self.send_admin_notification(f"{exchange_name} top symbol fetch error: {exc}", loud=True)
             return []
