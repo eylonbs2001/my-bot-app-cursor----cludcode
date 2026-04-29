@@ -1,30 +1,74 @@
-version: "3.9"
+# FalconEye — הרמת הבוט + PostgreSQL + Redis ברשת אחת.
+# ב-Docker השירותים נגישים בשמות: postgres, redis (לא localhost).
+# משתני .env שלך (מפתחות טלגרם וכו') נטענים מ-env_file; החיבורים למסד נדרסים כאן.
+
+name: falconeye
 
 services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: falconeye-bot:latest
+    container_name: falconeye-bot
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      DB_URL: postgresql://${POSTGRES_USER:-fortress}:${POSTGRES_PASSWORD:-fortress}@postgres:5432/${POSTGRES_DB:-trading_db}
+      REDIS_URL: redis://redis:6379/0
+      LEARNING_DB_PATH: /data/signals_log.db
+    volumes:
+      - bot_learning_data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 45s
+
   postgres:
     image: postgres:16-alpine
     container_name: fortress-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-trading_db}
       POSTGRES_USER: ${POSTGRES_USER:-fortress}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fortress}
+      POSTGRES_DB: ${POSTGRES_DB:-trading_db}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fortress} -d ${POSTGRES_DB:-trading_db}"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-fortress} -d ${POSTGRES_DB:-trading_db}",
+        ]
       interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 5
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   redis:
     image: redis:7-alpine
     container_name: fortress-redis
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     command: ["redis-server", "--appendonly", "yes"]
@@ -33,7 +77,14 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   postgres_data:
   redis_data:
+  bot_learning_data:
