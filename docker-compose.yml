@@ -1,5 +1,5 @@
 # FalconEye — הרמת הבוט + PostgreSQL + Redis ברשת אחת.
-# ב-Docker השירותים נגישים בשמות: postgres, redis (לא localhost).
+# ב-Docker השירותים נגישים בשמות הקונטיינרים, לא localhost.
 # משתני .env שלך (מפתחות טלגרם וכו') נטענים מ-env_file; החיבורים למסד נדרסים כאן.
 
 name: falconeye
@@ -16,10 +16,9 @@ services:
     env_file:
       - .env
     environment:
-      POSTGRES_HOST: postgres
+      POSTGRES_HOST: fortress-postgres
       POSTGRES_PORT: "5432"
-      DB_URL: postgresql://${POSTGRES_USER:-fortress}:${POSTGRES_PASSWORD:-fortress}@postgres:5432/${POSTGRES_DB:-trading_db}
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://fortress-redis:6379/0
       LEARNING_DB_PATH: /data/signals_log.db
     volumes:
       - bot_learning_data:/data
