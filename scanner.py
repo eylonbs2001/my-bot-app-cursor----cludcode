@@ -713,6 +713,10 @@ class FortressScanner:
             print(f"[TELEGRAM] admin channel loaded (admin_chat_id={self.admin_chat_id})")
         self.admin_pending_broadcast = False
         self.telegram_update_offset = 0
+        # Infra alert anti-spam: send at most one detailed alert per component
+        # during the cooldown window.
+        self.infra_alert_cooldown_sec = int(os.getenv("INFRA_ALERT_COOLDOWN_SEC", "900"))
+        self._infra_alert_last_sent: Dict[str, float] = {}
 
         self.trade_manager = TradeManager()
         try:
@@ -809,6 +813,37 @@ class FortressScanner:
                 print(f"[ADMIN] notify failed ({resp.status_code}): {resp.text}")
         except Exception as exc:
             print(f"[ADMIN] notify error: {exc}")
+
+    def _infra_component_from_error(self, text: str) -> Optional[str]:
+        low = text.lower()
+        if any(k in low for k in ["5432", "postgres", "asyncpg", "database", "db_url", "db "]):
+            return "database"
+        if any(k in low for k in ["redis", "6379"]):
+            return "redis"
+        return None
+
+    def notify_infra_issue_once(self, component: str, exc: Exception, context: str) -> None:
+        now = time.time()
+        last_sent = self._infra_alert_last_sent.get(component, 0.0)
+        if (now - last_sent) < self.infra_alert_cooldown_sec:
+            return
+        self._infra_alert_last_sent[component] = now
+        cooldown_min = max(1, self.infra_alert_cooldown_sec // 60)
+        error_text = str(exc).strip() or exc.__class__.__name__
+        message = (
+            "תקלה בתשתית הבוט (התרעה מרוכזת)\n"
+            f"רכיב: {'PostgreSQL' if component == 'database' else 'Redis'}\n"
+            f"מיקום: {context}\n"
+            f"שגיאה: {error_text[:500]}\n"
+            f"פעולה אוטומטית: הבוט ימשיך לנסות התחברות מחדש בלופים הבאים.\n"
+            f"מניעת ספאם פעילה: תישלח התרעה נוספת רק בעוד כ-{cooldown_min} דקות."
+        )
+        self.send_admin_notification(message, loud=True)
+
+    def _notify_if_infra_error(self, exc: Exception, context: str) -> None:
+        component = self._infra_component_from_error(str(exc))
+        if component:
+            self.notify_infra_issue_once(component=component, exc=exc, context=context)
 
     def configure_admin_menu_button(self) -> None:
         if not self.token or not self.admin_user_id:
@@ -2373,7 +2408,11 @@ class FortressScanner:
 
     def _run_async_task(self, coro):
         future = asyncio.run_coroutine_threadsafe(coro, self._async_loop)
-        return future.result()
+        try:
+            return future.result()
+        except Exception as exc:
+            self._notify_if_infra_error(exc, "async task")
+            raise
 
     async def _async_fetch_ohlcv(self, ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int) -> Optional[pd.DataFrame]:
         try:
