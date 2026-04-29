@@ -688,9 +688,14 @@ class FortressScanner:
         self.chat_id = (os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID") or "").strip()
         self.vip_plus_chat_id = os.getenv("VIP_PLUS_CHAT_ID", "").strip()
         self.admin_chat_id = os.getenv("ADMIN_CHAT_ID", "").strip()
-        self.admin_user_id = os.getenv("ADMIN_ID", "").strip() or self.admin_chat_id
-        # Fallback for alerting: if ADMIN_CHAT_ID is missing, send critical alerts to main chat.
-        self.alert_chat_id = self.admin_chat_id or self.chat_id
+        self.admin_user_id = os.getenv("ADMIN_ID", "").strip()
+        # Alerts are private-only by policy:
+        # 1) Prefer ADMIN_ID (private user id).
+        # 2) If ADMIN_ID is missing, allow ADMIN_CHAT_ID only when it is a
+        #    private numeric id (positive, not group/supergroup id).
+        self.alert_chat_id = self.admin_user_id
+        if not self.alert_chat_id and self.admin_chat_id and not self.admin_chat_id.startswith("-"):
+            self.alert_chat_id = self.admin_chat_id
         self.force_dual_test_send = (
             os.getenv("FORCE_DUAL_TEST_SEND", "false").strip().lower() == "true"
         )
@@ -711,6 +716,11 @@ class FortressScanner:
             print(f"[TELEGRAM] VIP+ channel loaded (vip_chat_id={self.vip_plus_chat_id})")
         if self.admin_chat_id:
             print(f"[TELEGRAM] admin channel loaded (admin_chat_id={self.admin_chat_id})")
+        if not self.alert_chat_id:
+            print(
+                "[ADMIN] private alerts disabled: set ADMIN_ID (recommended) "
+                "or positive ADMIN_CHAT_ID. Group IDs are blocked for alerts."
+            )
         self.admin_pending_broadcast = False
         self.telegram_update_offset = 0
         # Infra alert anti-spam: send at most one detailed alert per component
@@ -798,6 +808,10 @@ class FortressScanner:
     def send_admin_notification(self, text: str, loud: bool = True) -> None:
         target_chat_id = self.alert_chat_id
         if not self.token or not target_chat_id:
+            return
+        # Absolute guard: never send operational alerts to groups/channels.
+        if str(target_chat_id).startswith("-"):
+            print(f"[ADMIN] blocked alert to non-private chat id: {target_chat_id}")
             return
         body = f"🚨 {text}" if loud else f"✅ {text}"
         payload = {
