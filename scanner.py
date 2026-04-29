@@ -3705,17 +3705,23 @@ class FortressScanner:
         symbols = self.top_usdt_symbols(exchange_name, ex)
         if not symbols:
             return
+        worker_failures = 0
+        first_error: Optional[str] = None
         with ThreadPoolExecutor(max_workers=8) as pool:
             futures = [pool.submit(self.process_symbol, exchange_name, ex, symbol) for symbol in symbols]
             for f in as_completed(futures):
                 try:
                     f.result()
                 except Exception as exc:
+                    worker_failures += 1
+                    if first_error is None:
+                        first_error = str(exc)
                     print(f"[{exchange_name}] symbol worker failed: {exc}")
-                    self.send_admin_notification(
-                        f"{exchange_name} symbol worker failed: {exc}",
-                        loud=True,
-                    )
+        if worker_failures > 0:
+            self.send_admin_notification(
+                f"{exchange_name} workers failed: {worker_failures}/{len(symbols)} | first={first_error}",
+                loud=True,
+            )
 
     def run_cycle(self) -> None:
         if not self._run_async_task(self.trade_manager.is_bot_active()):
