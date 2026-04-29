@@ -248,11 +248,11 @@ class TradeManager:
                 SELECT 1
                 FROM signals
                 WHERE symbol = $1
-                  AND timestamp >= NOW() - ($2::text || ' minutes')::interval
+                  AND timestamp >= NOW() - make_interval(mins => $2::int)
                 LIMIT 1
                 """,
                 symbol,
-                minutes,
+                int(minutes),
             )
         return row is not None
 
