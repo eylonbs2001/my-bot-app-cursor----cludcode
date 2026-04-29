@@ -1,0 +1,71 @@
+# ===== Secrets & local config =====
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ===== Local databases / generated data =====
+*.db
+*.sqlite
+*.sqlite3
+signals_log.db
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# ===== Virtual environments =====
+venv/
+.venv/
+env/
+ENV/
+.envrc
+
+# ===== Build / packaging =====
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ===== Testing & coverage =====
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+nosetests.xml
+coverage.xml
+
+# ===== IDE / editors =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ===== Type checkers / linters =====
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+.pyre/
+
+# ===== Logs / temp =====
+*.log
+logs/
+tmp/
+temp/
+
+# ===== Cursor / Claude artifacts =====
+.cursor/
+.claude/
