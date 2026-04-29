@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import sqlite3
 import threading
 import time
@@ -641,6 +642,16 @@ class FortressScanner:
         # Daily delivery targets (can be overridden from env).
         self.daily_target_chat_signals = int(os.getenv("DAILY_TARGET_CHAT_SIGNALS", "30"))
         self.daily_target_vip_plus_signals = int(os.getenv("DAILY_TARGET_VIP_PLUS_SIGNALS", "30"))
+        # Publish when setup confidence meets this threshold (default: 75%).
+        self.signal_publish_threshold_pct = float(os.getenv("SIGNAL_PUBLISH_THRESHOLD_PCT", "75"))
+        self.signal_publish_threshold_score = max(
+            1,
+            min(10, int(math.ceil(self.signal_publish_threshold_pct / 10.0))),
+        )
+        print(
+            f"[DELIVERY] publish threshold={self.signal_publish_threshold_pct:.1f}% "
+            f"(score>={self.signal_publish_threshold_score}/10)"
+        )
 
         self.exchanges = {
             "Binance": ccxt.binance(
@@ -3301,6 +3312,8 @@ class FortressScanner:
             vip_plus_soft = bool(setup.get("vip_plus_soft_ok", False))
             vip_quality = bool(setup.get("vip_ok", False))
             vip_soft = bool(setup.get("vip_soft_ok", False))
+            setup_score = int(setup.get("score", 0))
+            score_qualified = setup_score >= self.signal_publish_threshold_score
 
             # Dynamic daily target windows tuned for higher daily throughput.
             vip_plus_sent_today = int(self.daily_flow.get("vip_plus_sent", 0))
@@ -3342,6 +3355,11 @@ class FortressScanner:
                 allow_vip_chat = False
             if not vip_plus_channel_on:
                 allow_vip_plus = False
+
+            # Throughput mode: any setup above configured confidence threshold is publishable.
+            if score_qualified:
+                allow_vip_chat = bool(vip_channel_on)
+                allow_vip_plus = bool(vip_plus_channel_on and self.vip_plus_chat_id)
 
             # VIP+ gets only 99%-tier confirmations (layers 1-8 all pass).
             if self.vip_plus_chat_id and allow_vip_plus:
