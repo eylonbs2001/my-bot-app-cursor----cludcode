@@ -55,7 +55,7 @@ class TradeManager:
             os.getenv("DATABASE_URL", "").strip()
             or os.getenv("DB_URL", "").strip()
         )
-        self.pg_host = os.getenv("POSTGRES_HOST", "localhost")
+        self.pg_host = os.getenv("POSTGRES_HOST", "fortress-postgres")
         self.pg_port = int(os.getenv("POSTGRES_PORT", "5432"))
         self.pg_user = os.getenv("POSTGRES_USER", "fortress")
         self.pg_password = os.getenv("POSTGRES_PASSWORD", "fortress")
@@ -74,10 +74,11 @@ class TradeManager:
             # fell back to localhost on Railway and only failed at ping time).
             print(
                 "[CRITICAL] REDIS_URL/REDIS_PRIVATE_URL/REDIS_PUBLIC_URL is not set. "
-                "Falling back to redis://localhost:6379/0 - this will fail unless a "
-                "local Redis is reachable on this host. Set REDIS_URL in your env."
+                "Falling back to redis://fortress-redis:6379/0 - this will fail unless "
+                "the fortress-redis container is reachable on this network. Set "
+                "REDIS_URL in your env."
             )
-            self.redis_url = "redis://localhost:6379/0"
+            self.redis_url = "redis://fortress-redis:6379/0"
         self.pool: Optional[asyncpg.Pool] = None
         self.redis: Optional[redis_async.Redis] = None
 
