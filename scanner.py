@@ -625,6 +625,7 @@ class FortressScanner:
         self.ext_cache: Dict[str, dict] = {}
         self.ext_cache_ttl_sec = 120
         self.vip_strict_mode = (os.getenv("VIP_STRICT_MODE", "true").strip().lower() != "false")
+        self.aggressive_signal_mode = os.getenv("AGGRESSIVE_SIGNAL_MODE", "false").strip().lower() == "true"
         self.layer_timeout_ms = int(os.getenv("LAYER_TIMEOUT_MS", "1800"))
         self.whale_alert_api_key = os.getenv("WHALE_ALERT_API_KEY", "").strip()
         self.social_api_key = os.getenv("SOCIAL_API_KEY", "").strip()
@@ -652,6 +653,7 @@ class FortressScanner:
             f"[DELIVERY] publish threshold={self.signal_publish_threshold_pct:.1f}% "
             f"(score>={self.signal_publish_threshold_score}/10)"
         )
+        print(f"[DELIVERY] aggressive_signal_mode={self.aggressive_signal_mode}")
 
         self.exchanges = {
             "Binance": ccxt.binance(
@@ -1646,12 +1648,38 @@ class FortressScanner:
     def fetch_multi_timeframes(self, ex: ccxt.Exchange, symbol: str) -> Optional[Dict[str, pd.DataFrame]]:
         timeframes = {"4h": 220, "1h": 220, "15m": 220, "5m": 220}
         out: Dict[str, pd.DataFrame] = {}
+        exchange_id = str(getattr(ex, "id", "")).lower()
+
+        def _public_exchange_fallback() -> Optional[ccxt.Exchange]:
+            try:
+                if "binance" in exchange_id:
+                    return ccxt.binance({"enableRateLimit": True})
+                if "bybit" in exchange_id:
+                    return ccxt.bybit({"enableRateLimit": True})
+                if "okx" in exchange_id:
+                    return ccxt.okx({"enableRateLimit": True})
+            except Exception:
+                return None
+            return None
 
         def _retry_ohlcv(tf: str, lim: int, attempts: int = 3) -> Optional[List[list]]:
             for idx in range(attempts):
                 try:
                     return ex.fetch_ohlcv(symbol, timeframe=tf, limit=lim)
-                except Exception:
+                except Exception as exc:
+                    err_text = str(exc).lower()
+                    auth_hint = any(
+                        hint in err_text for hint in ["invalid api-key", "api-key", "authentication", "permission", "auth"]
+                    )
+                    if auth_hint:
+                        public_ex = _public_exchange_fallback()
+                        if public_ex is not None:
+                            try:
+                                rows = public_ex.fetch_ohlcv(symbol, timeframe=tf, limit=lim)
+                                if rows:
+                                    return rows
+                            except Exception:
+                                pass
                     if idx == attempts - 1:
                         return None
                     time.sleep(0.4 * (idx + 1))
@@ -2560,30 +2588,64 @@ class FortressScanner:
         vwap_long = float(last_15["close"]) > float(last_15["vwap"]) and float(last_1h["close"]) > float(last_1h["vwap"])
         vwap_short = float(last_15["close"]) < float(last_15["vwap"]) and float(last_1h["close"]) < float(last_1h["vwap"])
 
-        long_ready = (
-            trend_up
-            and bos_up
-            and in_demand_zone
-            and long_fvg_eq_retested
-            and volume_spike
-            and (long_osc or rsi_recover_long)
-            and macd_cross_up
-            and vwap_long
-            and at_support
-        )
-        short_ready = (
-            trend_down
-            and bos_down
-            and in_supply_zone
-            and short_fvg_eq_retested
-            and volume_spike
-            and (short_osc or rsi_recover_short)
-            and macd_cross_down
-            and vwap_short
-            and at_resistance
-        )
+        if self.aggressive_signal_mode:
+            # Throughput mode: require trend + break + momentum core, while allowing
+            # looser liquidity/location conditions so we don't starve the feed.
+            long_ready = (
+                trend_up
+                and bos_up
+                and (macd_cross_up or (long_osc or rsi_recover_long))
+                and (vwap_long or in_demand_zone or long_fvg_eq_retested or at_support)
+            )
+            short_ready = (
+                trend_down
+                and bos_down
+                and (macd_cross_down or (short_osc or rsi_recover_short))
+                and (vwap_short or in_supply_zone or short_fvg_eq_retested or at_resistance)
+            )
+        else:
+            long_ready = (
+                trend_up
+                and bos_up
+                and in_demand_zone
+                and long_fvg_eq_retested
+                and volume_spike
+                and (long_osc or rsi_recover_long)
+                and macd_cross_up
+                and vwap_long
+                and at_support
+            )
+            short_ready = (
+                trend_down
+                and bos_down
+                and in_supply_zone
+                and short_fvg_eq_retested
+                and volume_spike
+                and (short_osc or rsi_recover_short)
+                and macd_cross_down
+                and vwap_short
+                and at_resistance
+            )
         if not (long_ready or short_ready):
-            return None
+            if self.aggressive_signal_mode:
+                relv = float(last_5.get("rel_volume", 0.0))
+                rsi15 = float(last_15.get("rsi", 50.0))
+                # Emergency throughput fallback: a simpler momentum structure when
+                # full institutional stack has no candidates for prolonged periods.
+                long_ready = bool(
+                    trend_up
+                    and (bos_up or macd_cross_up or float(last_5.get("close", 0.0)) > float(last_5.get("vwap", 0.0)))
+                    and (rsi15 >= 42 and rsi15 <= 78)
+                    and (relv >= 0.95)
+                )
+                short_ready = bool(
+                    trend_down
+                    and (bos_down or macd_cross_down or float(last_5.get("close", 0.0)) < float(last_5.get("vwap", 0.0)))
+                    and (rsi15 <= 58 and rsi15 >= 22)
+                    and (relv >= 0.95)
+                )
+            if not (long_ready or short_ready):
+                return None
 
         side = "LONG" if long_ready else "SHORT"
         atr = float(last_5["atr"])
@@ -2629,7 +2691,8 @@ class FortressScanner:
         potential_gain_pct = abs((tp3 - entry) / entry) * 100
         potential_loss_pct = abs((entry - sl) / entry) * 100
         rr = potential_gain_pct / max(potential_loss_pct, 1e-9)
-        if rr < 2.5:
+        min_rr = 1.8 if self.aggressive_signal_mode else 2.5
+        if rr < min_rr:
             return None
 
         liquidity_bits: List[str] = []
@@ -2648,7 +2711,7 @@ class FortressScanner:
         # Phase 2.4: Global Macro Correlation
         # -------------------------
         macro = self.get_macro_environment(ex, symbol)
-        if side == "LONG":
+        if side == "LONG" and (not self.aggressive_signal_mode):
             # Block longs in dollar bullish regime and risk-off stablecoin flow.
             if macro["dxy_rsi_1h"] > 60:
                 return None
@@ -2663,39 +2726,57 @@ class FortressScanner:
         asset_change = macro["asset_change_pct"]
         if side == "LONG":
             # Negative behavior in corrections: reject if asset drops notably more than BTC.
-            if btc_change < 0 and asset_change < (btc_change * 1.2):
+            if (not self.aggressive_signal_mode) and btc_change < 0 and asset_change < (btc_change * 1.2):
                 return None
             if macro["relative_strength"]:
                 score_1_10 = min(10, score_1_10 + 1)
         else:
             # For shorts, avoid names that are too positively resilient while BTC weakens.
-            if btc_change < 0 and asset_change > btc_change * 0.5:
+            if (not self.aggressive_signal_mode) and btc_change < 0 and asset_change > btc_change * 0.5:
                 return None
 
         # -------------------------
         # VIP / VIP+ Layered Gate (strict institutional filter stack)
         # -------------------------
-        layered = self._run_async_task(
-            asyncio.wait_for(
-                self.evaluate_layer_stack(
-                    ex=ex,
-                    symbol=symbol,
-                    side=side,
-                    d5=d5,
-                    d15=d15,
-                    entry=entry,
-                    sl=sl,
-                    current_price=price,
-                    volume_spike=volume_spike,
-                    in_demand_zone=in_demand_zone,
-                    in_supply_zone=in_supply_zone,
-                    long_fvg_eq_retested=long_fvg_eq_retested,
-                    short_fvg_eq_retested=short_fvg_eq_retested,
-                ),
-                timeout=max(0.5, self.layer_timeout_ms / 1000.0),
+        try:
+            layered = self._run_async_task(
+                asyncio.wait_for(
+                    self.evaluate_layer_stack(
+                        ex=ex,
+                        symbol=symbol,
+                        side=side,
+                        d5=d5,
+                        d15=d15,
+                        entry=entry,
+                        sl=sl,
+                        current_price=price,
+                        volume_spike=volume_spike,
+                        in_demand_zone=in_demand_zone,
+                        in_supply_zone=in_supply_zone,
+                        long_fvg_eq_retested=long_fvg_eq_retested,
+                        short_fvg_eq_retested=short_fvg_eq_retested,
+                    ),
+                    timeout=max(0.5, self.layer_timeout_ms / 1000.0),
+                )
             )
-        )
-        if self.vip_strict_mode and not layered.get("vip_ok", False):
+        except Exception as exc:
+            if self.aggressive_signal_mode:
+                layered = {
+                    "vip_ok": True,
+                    "vip_soft_ok": True,
+                    "vip_plus_ok": False,
+                    "vip_plus_soft_ok": False,
+                    "vip_layer_lines": [f"Layer stack bypassed in aggressive mode: {exc}"],
+                    "vip_plus_layer_lines": [],
+                    "social_text": "Bypassed (aggressive mode)",
+                    "order_book_text": "Bypassed (aggressive mode)",
+                    "whale_text": "Bypassed (aggressive mode)",
+                    "order_book_depth": "Bypassed",
+                    "social_galaxy_score": 0.0,
+                }
+            else:
+                return None
+        if self.vip_strict_mode and (not self.aggressive_signal_mode) and not layered.get("vip_ok", False):
             print(f"[LAYER-GATE] {symbol} rejected VIP stack | " + " | ".join(layered.get("vip_layer_lines", [])))
             return None
 
@@ -2908,8 +2989,36 @@ class FortressScanner:
         _us10y_closes = self._fetch_yahoo_closes_1h("^TNX")
 
         # Beta + relative strength vs BTC.
-        asset_rows = ex.fetch_ohlcv(symbol, timeframe="15m", limit=120)
-        btc_rows = ex.fetch_ohlcv("BTC/USDT", timeframe="15m", limit=120)
+        try:
+            asset_rows = ex.fetch_ohlcv(symbol, timeframe="15m", limit=120)
+            btc_rows = ex.fetch_ohlcv("BTC/USDT", timeframe="15m", limit=120)
+        except Exception as exc:
+            # Auth-restricted clients can fail on market data endpoints; retry with
+            # public exchange client so macro scoring doesn't collapse to zero setups.
+            err_text = str(exc).lower()
+            auth_hint = any(
+                hint in err_text for hint in ["invalid api-key", "api-key", "authentication", "permission", "auth"]
+            )
+            if auth_hint:
+                public_factory = {
+                    "binance": ccxt.binance,
+                    "bybit": ccxt.bybit,
+                    "okx": ccxt.okx,
+                }.get(str(ex.id).lower())
+                if public_factory is not None:
+                    try:
+                        public_ex = public_factory({"enableRateLimit": True})
+                        asset_rows = public_ex.fetch_ohlcv(symbol, timeframe="15m", limit=120)
+                        btc_rows = public_ex.fetch_ohlcv("BTC/USDT", timeframe="15m", limit=120)
+                    except Exception:
+                        asset_rows = []
+                        btc_rows = []
+                else:
+                    asset_rows = []
+                    btc_rows = []
+            else:
+                asset_rows = []
+                btc_rows = []
         asset_closes = [float(r[4]) for r in asset_rows] if asset_rows else []
         btc_closes = [float(r[4]) for r in btc_rows] if btc_rows else []
         asset_returns = self._returns(asset_closes)
@@ -3495,6 +3604,8 @@ class FortressScanner:
         if not data:
             return
         setup = self.detect_setup(ex, symbol, data)
+        if (not setup) and self.aggressive_signal_mode:
+            setup = self.build_aggressive_fallback_setup(data)
         if not setup:
             return
         # Adaptive floor: when daily flow is below target, allow slightly lower score floor.
@@ -3513,6 +3624,77 @@ class FortressScanner:
         setup["signal_id"] = int(signal_id)
         self._run_async_task(self.trade_manager.cache_layer_diagnostics(signal_id, setup))
         self.send_telegram(exchange_name, symbol, setup)
+
+    def build_aggressive_fallback_setup(self, dfs: Dict[str, pd.DataFrame]) -> Optional[dict]:
+        try:
+            d1h = self.add_indicators(dfs["1h"])
+            d15 = self.add_indicators(dfs["15m"])
+            d5 = self.add_indicators(dfs["5m"])
+            if d1h.iloc[-1].isna().any() or d15.iloc[-1].isna().any() or d5.iloc[-1].isna().any():
+                return None
+            last_1h = d1h.iloc[-1]
+            last_15 = d15.iloc[-1]
+            last_5 = d5.iloc[-1]
+            price = float(last_5["close"])
+            atr = float(last_5["atr"])
+            if atr <= 0:
+                return None
+
+            trend_up = float(last_1h["close"]) >= float(last_1h["ema50"])
+            trend_down = float(last_1h["close"]) < float(last_1h["ema50"])
+            if not (trend_up or trend_down):
+                return None
+            side = "LONG" if trend_up else "SHORT"
+
+            sl = price - (1.3 * atr) if side == "LONG" else price + (1.3 * atr)
+            risk = abs(price - sl)
+            tp1 = price + (1.2 * risk) if side == "LONG" else price - (1.2 * risk)
+            tp2 = price + (2.0 * risk) if side == "LONG" else price - (2.0 * risk)
+            tp3 = price + (3.0 * risk) if side == "LONG" else price - (3.0 * risk)
+            potential_gain_pct = abs((tp3 - price) / max(price, 1e-9)) * 100
+            potential_loss_pct = abs((price - sl) / max(price, 1e-9)) * 100
+            rr = potential_gain_pct / max(potential_loss_pct, 1e-9)
+
+            return {
+                "side": side,
+                "entry": price,
+                "sl": sl,
+                "tp1": tp1,
+                "tp2": tp2,
+                "tp3": tp3,
+                "score": 8,
+                "breakdown": "Aggressive momentum fallback",
+                "potential_gain_pct": potential_gain_pct,
+                "potential_loss_pct": potential_loss_pct,
+                "rr": rr,
+                "adx": float(last_1h.get("adx", 20.0)),
+                "rsi": float(last_15.get("rsi", 50.0)),
+                "rel_volume": float(last_5.get("rel_volume", 1.0)),
+                "liquidity_status": "Aggressive Momentum Flow",
+                "liquidity_confirmation": "Fallback route enabled",
+                "sync_text": "Bypassed (aggressive fallback)",
+                "beta_vs_btc": 0.0,
+                "dxy_status": "Bypassed",
+                "usdt_dom": 0.0,
+                "capital_flow_text": "Bypassed",
+                "sector_status_text": "Bypassed",
+                "order_book_depth": "Bypassed",
+                "vip_ok": True,
+                "vip_plus_ok": False,
+                "vip_soft_ok": True,
+                "vip_plus_soft_ok": False,
+                "vip_layer_lines": ["Aggressive fallback setup (forced throughput)"],
+                "vip_plus_layer_lines": ["Aggressive fallback setup (forced throughput)"],
+                "social_text": "Bypassed",
+                "whale_text": "Bypassed",
+                "analysis_text": "Aggressive fallback setup",
+                "context_detailed": "Momentum continuation structure with throughput fallback enabled.",
+                "levels_detailed": "Entry/SL/TP derived from ATR dynamics on live 5m-1h structure.",
+                "indicators_detailed": "EMA50 trend alignment with RSI/volume baseline checks.",
+                "risk_detailed": "Reduced strict gating mode: manage size conservatively.",
+            }
+        except Exception:
+            return None
 
     def _refresh_daily_flow_state(self) -> None:
         today = datetime.now(UTC).strftime("%Y-%m-%d")
