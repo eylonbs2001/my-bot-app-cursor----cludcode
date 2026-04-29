@@ -861,6 +861,25 @@ class FortressScanner:
         if component:
             self.notify_infra_issue_once(component=component, exc=exc, context=context)
 
+    def notify_worker_failure_once(self, exchange_name: str, failed: int, total: int, first_error: str) -> None:
+        # Dedicated anti-spam channel for exchange worker bursts.
+        component_key = f"workers_{exchange_name.lower()}"
+        now = time.time()
+        last_sent = self._infra_alert_last_sent.get(component_key, 0.0)
+        if (now - last_sent) < self.infra_alert_cooldown_sec:
+            return
+        self._infra_alert_last_sent[component_key] = now
+        cooldown_min = max(1, self.infra_alert_cooldown_sec // 60)
+        msg = (
+            "תקלה מרוכזת במנוע הסריקה\n"
+            f"בורסה: {exchange_name}\n"
+            f"עובדים שנכשלו: {failed}/{total}\n"
+            f"שגיאה ראשונה: {(first_error or 'לא זוהתה שגיאה')[:500]}\n"
+            "הערה: ההתרעה נשלחת אך ורק לאדמין בצ'אט פרטי.\n"
+            f"מניעת ספאם פעילה: הודעה נוספת תישלח רק בעוד כ-{cooldown_min} דקות."
+        )
+        self.send_admin_notification(msg, loud=True)
+
     def configure_admin_menu_button(self) -> None:
         if not self.token or not self.admin_user_id:
             return
@@ -3778,9 +3797,11 @@ class FortressScanner:
                         first_error = str(exc)
                     print(f"[{exchange_name}] symbol worker failed: {exc}")
         if worker_failures > 0:
-            self.send_admin_notification(
-                f"{exchange_name} workers failed: {worker_failures}/{len(symbols)} | first={first_error}",
-                loud=True,
+            self.notify_worker_failure_once(
+                exchange_name=exchange_name,
+                failed=worker_failures,
+                total=len(symbols),
+                first_error=(first_error or ""),
             )
 
     def run_cycle(self) -> None:
