@@ -1,9 +1,11 @@
 import argparse
 import asyncio
+import io
 import os
 from datetime import UTC, datetime
 
 import asyncpg
+import matplotlib.pyplot as plt
 import requests
 from dotenv import load_dotenv
 
@@ -57,6 +59,43 @@ def send_message(token: str, payload: dict) -> requests.Response:
     )
 
 
+def build_test_chart_image(symbol: str) -> bytes:
+    x_vals = list(range(20))
+    y_vals = [
+        68200, 68250, 68320, 68410, 68380, 68490, 68530, 68620, 68580, 68690,
+        68740, 68810, 68760, 68890, 68980, 69060, 69120, 69240, 69310, 69400,
+    ]
+    fig, ax = plt.subplots(figsize=(8, 4), dpi=170)
+    ax.plot(x_vals, y_vals, linewidth=2.2, color="#2E86DE")
+    ax.fill_between(x_vals, y_vals, min(y_vals) - 120, alpha=0.15, color="#2E86DE")
+    ax.set_title(f"{symbol} 1H Simulation Chart")
+    ax.set_xlabel("Recent candles")
+    ax.set_ylabel("Price")
+    ax.grid(alpha=0.25)
+    ax.text(
+        x_vals[-1],
+        y_vals[-1],
+        f"  {y_vals[-1]:,.0f}",
+        fontsize=9,
+        va="center",
+        color="#1B4F72",
+    )
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def send_photo(token: str, chat_id: str, caption: str, image_bytes: bytes, parse_mode: str = "MarkdownV2") -> requests.Response:
+    return requests.post(
+        f"https://api.telegram.org/bot{token}/sendPhoto",
+        data={"chat_id": chat_id, "caption": caption, "parse_mode": parse_mode},
+        files={"photo": ("chart.png", image_bytes, "image/png")},
+        timeout=30,
+    )
+
+
 async def main(keep_row: bool) -> int:
     load_dotenv(dotenv_path=".env")
 
@@ -105,8 +144,8 @@ async def main(keep_row: bool) -> int:
         signal_ts = inserted["timestamp"]
         print(f"  -> created signal id={inserted_id} timestamp={signal_ts}")
 
-        print("[2/5] Sending fake ELITE signal to both groups...")
-        signal_text = (
+        print("[2/5] Sending fake signals with fixed VIP/VIP+ formats...")
+        vip_plus_signal_text = (
             "⚡️🚨 *ELITE SIGNAL* 🚨⚡️\n\n"
             f"*{mdv2_code('TESTBTC/USDT')}*\n"
             f"Position: *{mdv2_code('LONG')}* 📈\n"
@@ -119,14 +158,53 @@ async def main(keep_row: bool) -> int:
             f"🎯 T1: {mdv2_code('$69,200.00')}\n"
             f"🎯 T2: {mdv2_code('$69,850.00')}\n"
             f"🎯 T3: {mdv2_code('$70,400.00')}\n"
+            "━━━━━━━━━━━━━━\n"
+            "📊 *Technical Analysis*\n"
+            f"🔹 *Context:* {mdv2_code('Bullish continuation structure after 4H compression break')}\n"
+            f"🔹 *Support/Resistance:* {mdv2_code('EMA20/50 aligned below price; local ceiling near 69,850 now acting as pivot')}\n"
+            f"🔹 *Indicators:* {mdv2_code('RSI 63 rising, MACD positive expansion, volume confirms breakout participation')}\n"
+            f"🔹 *Risk:* {mdv2_code('Invalidation on sustained trade below 67,800 and weakening follow-through volume')}\n"
+            "━━━━━━━━━━━━━━\n"
+            "💧 *Liquidity*\n"
+            f"🔹 Status: {mdv2_code('Bid-side absorption')}\n"
+            f"🔹 Confirmation: {mdv2_code('Sweep-and-reclaim above intraday liquidity pocket')}\n"
+            "━━━━━━━━━━━━━━\n"
+            "⚖️ *Risk / Reward*\n"
+            f"🔹 Ratio: {mdv2_code('1:2.45')}\n"
+            f"🔹 Risk to SL: {mdv2_code('0.95%')}\n"
+            "━━━━━━━━━━━━━━\n"
+            "✨ *VIP\\+ EXTENSIONS*\n"
+            f"🔥 Confidence Level: {mdv2_code('89%')}\n"
+            "━━━━━━━━━━━━━━"
         )
-        res_vip = send_message(
-            token,
-            {"chat_id": vip_chat_id, "text": signal_text, "parse_mode": "MarkdownV2"},
+        vip_signal_text = (
+            "💎🦅 *FALCON ALERT* 🦅💎\n\n"
+            f"*{mdv2_code('TESTBTC/USDT')}*\n"
+            f"Position: *{mdv2_code('LONG')}* 📈\n"
+            f"Leverage: *{mdv2_code('x10')}*\n"
+            "━━━━━━━━━━━━━━\n"
+            f"📥 *Entry:* {mdv2_code('$68,450.50')}\n"
+            f"🛑 *Stop Loss:* {mdv2_code('$67,800.00')} \\({mdv2_code('0.95%')}\\)\n"
+            "━━━━━━━━━━━━━━\n"
+            "*Targets*\n"
+            f"🎯 T1: {mdv2_code('$69,200.00')}\n"
+            f"🎯 T2: {mdv2_code('$69,850.00')}\n"
+            f"🎯 T3: {mdv2_code('$70,400.00')}"
         )
-        res_vip_plus = send_message(
-            token,
-            {"chat_id": vip_plus_chat_id, "text": signal_text, "parse_mode": "MarkdownV2"},
+        chart_bytes = build_test_chart_image("TESTBTC/USDT")
+        res_vip = send_photo(
+            token=token,
+            chat_id=vip_chat_id,
+            caption=vip_signal_text,
+            image_bytes=chart_bytes,
+            parse_mode="MarkdownV2",
+        )
+        res_vip_plus = send_photo(
+            token=token,
+            chat_id=vip_plus_chat_id,
+            caption=vip_plus_signal_text,
+            image_bytes=chart_bytes,
+            parse_mode="MarkdownV2",
         )
         print(f"  -> VIP send status={res_vip.status_code} ok={res_vip.ok}")
         print(f"  -> VIP+ send status={res_vip_plus.status_code} ok={res_vip_plus.ok}")

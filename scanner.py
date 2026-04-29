@@ -3,6 +3,7 @@ import json
 import sqlite3
 import threading
 import time
+import tempfile
 import io
 import statistics
 import asyncio
@@ -64,6 +65,7 @@ class TradeManager:
             or os.getenv("REDIS_PUBLIC_URL")
             or ""
         )
+        self.redis_required = os.getenv("REDIS_REQUIRED", "false").strip().lower() == "true"
         self._redis_url_explicit = bool(self.redis_url)
         if not self.redis_url:
             # No Redis URL configured. Print a loud, parseable warning so this
@@ -115,8 +117,17 @@ class TradeManager:
         self.redis = redis_async.from_url(self.redis_url, decode_responses=True)
         if self.redis is None:
             raise RuntimeError("Redis connection is not initialized; call startup() first")
-        await self.redis.ping()
-        print("Redis Connected")
+        try:
+            await self.redis.ping()
+            print("Redis Connected")
+        except Exception as exc:
+            print(
+                f"[WARN] Redis unavailable ({exc}). "
+                "Continuing without Redis cache/state. Set REDIS_REQUIRED=true to fail fast."
+            )
+            self.redis = None
+            if self.redis_required:
+                raise
         await self._init_schema()
         return await self.recover_active_trades()
 
@@ -596,7 +607,7 @@ class FortressScanner:
         self.alert_cooldown_seconds = 60 * 60
         self.last_alert_at: Dict[str, float] = {}
         # Keep local SQLite only for adaptive learning state.
-        self.db_path = "signals_log.db"
+        self.db_path = self._resolve_learning_db_path()
         self.db_executor = ThreadPoolExecutor(max_workers=1)
 
         self.last_daily_report_date = datetime.now(UTC).date()
@@ -664,6 +675,8 @@ class FortressScanner:
         self.vip_plus_chat_id = os.getenv("VIP_PLUS_CHAT_ID", "").strip()
         self.admin_chat_id = os.getenv("ADMIN_CHAT_ID", "").strip()
         self.admin_user_id = os.getenv("ADMIN_ID", "").strip() or self.admin_chat_id
+        # Fallback for alerting: if ADMIN_CHAT_ID is missing, send critical alerts to main chat.
+        self.alert_chat_id = self.admin_chat_id or self.chat_id
         self.force_dual_test_send = (
             os.getenv("FORCE_DUAL_TEST_SEND", "false").strip().lower() == "true"
         )
@@ -690,19 +703,19 @@ class FortressScanner:
         self.trade_manager = TradeManager()
         try:
             recovered = self._run_async_task(self.trade_manager.startup())
-        except Exception as exc:
-            self.send_admin_notification(f"Startup DB failure: {exc}", loud=True)
-            raise
-        print(f"[TRADE-MANAGER] connected | recovered active trades: {len(recovered)}")
+            print(f"[TRADE-MANAGER] connected | recovered active trades: {len(recovered)}")
 
-        self.init_db()
-        self.load_learning_state()
-        self.status_thread = threading.Thread(target=self.status_watcher_loop, daemon=True)
-        self.status_thread.start()
-        self.daily_report_thread = threading.Thread(target=self.daily_report_loop, daemon=True)
-        self.daily_report_thread.start()
-        self.admin_thread = threading.Thread(target=self.admin_interface_loop, daemon=True)
-        self.admin_thread.start()
+            self.init_db()
+            self.load_learning_state()
+            self.status_thread = threading.Thread(target=self.status_watcher_loop, daemon=True)
+            self.status_thread.start()
+            self.daily_report_thread = threading.Thread(target=self.daily_report_loop, daemon=True)
+            self.daily_report_thread.start()
+            self.admin_thread = threading.Thread(target=self.admin_interface_loop, daemon=True)
+            self.admin_thread.start()
+        except Exception as exc:
+            self.send_admin_notification(f"Startup failure: {exc}", loud=True)
+            raise
 
     # -------------------------
     # 0) Local Learning-State (SQLite)
@@ -714,6 +727,9 @@ class FortressScanner:
 
     def init_db(self) -> None:
         def _create() -> None:
+            db_dir = os.path.dirname(os.path.abspath(self.db_path))
+            if db_dir:
+                os.makedirs(db_dir, exist_ok=True)
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute(
                     "PRAGMA journal_mode=WAL"
@@ -733,12 +749,39 @@ class FortressScanner:
         self.db_executor.submit(_create).result()
         print(f"[LEARNING-DB] ready at {self.db_path}")
 
+    @staticmethod
+    def _resolve_learning_db_path() -> str:
+        """Pick a writable SQLite path across local/dev/cloud runtimes."""
+        configured = os.getenv("LEARNING_DB_PATH", "").strip()
+        candidates = []
+        if configured:
+            candidates.append(configured)
+        candidates.extend(
+            [
+                os.path.join(os.getcwd(), "signals_log.db"),
+                os.path.join(tempfile.gettempdir(), "signals_log.db"),
+            ]
+        )
+        for candidate in candidates:
+            try:
+                db_dir = os.path.dirname(os.path.abspath(candidate))
+                if db_dir:
+                    os.makedirs(db_dir, exist_ok=True)
+                with open(candidate, "a", encoding="utf-8"):
+                    pass
+                return candidate
+            except Exception:
+                continue
+        # Last resort: this will still raise later, but includes explicit path in logs.
+        return os.path.join(tempfile.gettempdir(), "signals_log.db")
+
     def send_admin_notification(self, text: str, loud: bool = True) -> None:
-        if not self.token or not self.admin_chat_id:
+        target_chat_id = self.alert_chat_id
+        if not self.token or not target_chat_id:
             return
         body = f"🚨 {text}" if loud else f"✅ {text}"
         payload = {
-            "chat_id": self.admin_chat_id,
+            "chat_id": target_chat_id,
             "text": body,
             "disable_notification": (not loud),
         }
