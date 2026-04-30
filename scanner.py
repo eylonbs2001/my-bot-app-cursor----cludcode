@@ -144,6 +144,7 @@ class TradeManager:
                     timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     exchange TEXT NOT NULL,
                     symbol TEXT NOT NULL,
+                    timeframe TEXT NOT NULL DEFAULT '15m',
                     side TEXT NOT NULL,
                     entry_price DOUBLE PRECISION NOT NULL,
                     stop_loss DOUBLE PRECISION NOT NULL,
@@ -151,6 +152,9 @@ class TradeManager:
                     tp2 DOUBLE PRECISION NOT NULL,
                     tp3 DOUBLE PRECISION NOT NULL,
                     score INTEGER NOT NULL,
+                    rsi_snapshot DOUBLE PRECISION,
+                    adx_snapshot DOUBLE PRECISION,
+                    rel_volume_snapshot DOUBLE PRECISION,
                     status TEXT NOT NULL DEFAULT 'Pending',
                     last_price DOUBLE PRECISION,
                     original_message_id BIGINT,
@@ -162,6 +166,18 @@ class TradeManager:
             )
             await conn.execute(
                 "ALTER TABLE signals ADD COLUMN IF NOT EXISTS original_message_id BIGINT"
+            )
+            await conn.execute(
+                "ALTER TABLE signals ADD COLUMN IF NOT EXISTS timeframe TEXT NOT NULL DEFAULT '15m'"
+            )
+            await conn.execute(
+                "ALTER TABLE signals ADD COLUMN IF NOT EXISTS rsi_snapshot DOUBLE PRECISION"
+            )
+            await conn.execute(
+                "ALTER TABLE signals ADD COLUMN IF NOT EXISTS adx_snapshot DOUBLE PRECISION"
+            )
+            await conn.execute(
+                "ALTER TABLE signals ADD COLUMN IF NOT EXISTS rel_volume_snapshot DOUBLE PRECISION"
             )
             await conn.execute(
                 "ALTER TABLE signals ADD COLUMN IF NOT EXISTS original_chat_id TEXT"
@@ -177,6 +193,32 @@ class TradeManager:
             )
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_signals_status_pg ON signals(status)"
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trade_journal (
+                    id BIGSERIAL PRIMARY KEY,
+                    signal_id BIGINT UNIQUE,
+                    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    timeframe TEXT NOT NULL DEFAULT '15m',
+                    side TEXT NOT NULL,
+                    entry_price DOUBLE PRECISION NOT NULL,
+                    exit_price DOUBLE PRECISION,
+                    score INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    result_reason TEXT,
+                    last_target_hit INTEGER NOT NULL DEFAULT 0,
+                    rsi_snapshot DOUBLE PRECISION,
+                    adx_snapshot DOUBLE PRECISION,
+                    rel_volume_snapshot DOUBLE PRECISION,
+                    closed_at TIMESTAMPTZ
+                )
+                """
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trade_journal_time ON trade_journal(timestamp DESC)"
             )
             await conn.execute(
                 """
@@ -265,13 +307,15 @@ class TradeManager:
             signal_id = await conn.fetchval(
                 """
                 INSERT INTO signals (
-                    exchange, symbol, side, entry_price, stop_loss, tp1, tp2, tp3, score, status
+                    exchange, symbol, timeframe, side, entry_price, stop_loss, tp1, tp2, tp3, score,
+                    rsi_snapshot, adx_snapshot, rel_volume_snapshot, status
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Pending')
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'Pending')
                 RETURNING id
                 """,
                 exchange_name,
                 symbol,
+                str(setup.get("timeframe", "15m")),
                 setup["side"],
                 float(setup["entry"]),
                 float(setup["sl"]),
@@ -279,6 +323,9 @@ class TradeManager:
                 float(setup["tp2"]),
                 float(setup["tp3"]),
                 int(setup["score"]),
+                float(setup.get("rsi", 50.0)),
+                float(setup.get("adx", 20.0)),
+                float(setup.get("rel_volume", 1.0)),
             )
         await self.redis.hset(
             f"active_trade:{signal_id}",
@@ -339,7 +386,89 @@ class TradeManager:
                 float(last_price),
                 int(signal_id),
             )
+            if status in ("Hit TP", "Hit SL", "Timed Out", "Replaced", "Expired"):
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, exchange, symbol, timeframe, side, entry_price, score,
+                           COALESCE(last_target_hit, 0) AS last_target_hit,
+                           rsi_snapshot, adx_snapshot, rel_volume_snapshot
+                    FROM signals
+                    WHERE id = $1
+                    """,
+                    int(signal_id),
+                )
+                if row:
+                    await conn.execute(
+                        """
+                        INSERT INTO trade_journal (
+                            signal_id, exchange, symbol, timeframe, side, entry_price, exit_price, score,
+                            status, result_reason, last_target_hit, rsi_snapshot, adx_snapshot, rel_volume_snapshot, closed_at
+                        )
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW())
+                        ON CONFLICT (signal_id) DO UPDATE SET
+                            exit_price = EXCLUDED.exit_price,
+                            status = EXCLUDED.status,
+                            result_reason = EXCLUDED.result_reason,
+                            last_target_hit = EXCLUDED.last_target_hit,
+                            closed_at = NOW()
+                        """,
+                        int(row["id"]),
+                        str(row["exchange"]),
+                        str(row["symbol"]),
+                        str(row["timeframe"] or "15m"),
+                        str(row["side"]),
+                        float(row["entry_price"]),
+                        float(last_price),
+                        int(row["score"]),
+                        str(status),
+                        str(status),
+                        int(row["last_target_hit"]),
+                        float(row["rsi_snapshot"] or 50.0),
+                        float(row["adx_snapshot"] or 20.0),
+                        float(row["rel_volume_snapshot"] or 1.0),
+                    )
         await self.redis.delete(f"active_trade:{signal_id}")
+
+    async def fetch_recent_trade_journal(self, limit: int = 50) -> List[dict]:
+        if self.pool is None:
+            raise RuntimeError("Postgres pool is not initialized; call startup() first")
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT signal_id, exchange, symbol, timeframe, status, score,
+                       COALESCE(rsi_snapshot, 50) AS rsi_snapshot
+                FROM trade_journal
+                ORDER BY timestamp DESC
+                LIMIT $1
+                """,
+                int(limit),
+            )
+        return [dict(r) for r in rows]
+
+    async def get_daily_count_and_lowest_pending(self, day_utc: str) -> Tuple[int, Optional[dict]]:
+        if self.pool is None:
+            raise RuntimeError("Postgres pool is not initialized; call startup() first")
+        async with self.pool.acquire() as conn:
+            total = await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM signals
+                WHERE (timestamp AT TIME ZONE 'UTC')::date = $1::date
+                """,
+                str(day_utc),
+            )
+            lowest = await conn.fetchrow(
+                """
+                SELECT id, score, last_price, entry_price
+                FROM signals
+                WHERE (timestamp AT TIME ZONE 'UTC')::date = $1::date
+                  AND status IN ('Pending', 'T1_DONE', 'T2_DONE')
+                ORDER BY score ASC, id ASC
+                LIMIT 1
+                """,
+                str(day_utc),
+            )
+        return int(total or 0), (dict(lowest) if lowest else None)
 
     async def update_target_progress(self, signal_id: int, target_hit: int, last_price: float) -> None:
         if self.pool is None:
@@ -424,6 +553,50 @@ class TradeManager:
         }
         await self.redis.hset(f"signal_layers:{signal_id}", mapping=payload)
         await self.redis.expire(f"signal_layers:{signal_id}", 60 * 60 * 24)
+
+    async def is_symbol_on_cooldown(self, exchange_name: str, symbol: str) -> bool:
+        if self.redis is None:
+            raise RuntimeError("Redis connection is not initialized; call startup() first")
+        key = f"signal_cd:{exchange_name}:{symbol}"
+        val = await self.redis.get(key)
+        return val is not None
+
+    async def mark_symbol_cooldown(self, exchange_name: str, symbol: str, cooldown_seconds: int) -> None:
+        if self.redis is None:
+            raise RuntimeError("Redis connection is not initialized; call startup() first")
+        key = f"signal_cd:{exchange_name}:{symbol}"
+        await self.redis.set(key, "1", ex=max(60, int(cooldown_seconds)))
+
+    async def count_signals_last_window(self, window_seconds: int) -> int:
+        if self.redis is None:
+            raise RuntimeError("Redis connection is not initialized; call startup() first")
+        key = "signal_throttle_window"
+        now = int(time.time())
+        min_score = now - int(window_seconds)
+        await self.redis.zremrangebyscore(key, 0, min_score)
+        count = await self.redis.zcard(key)
+        await self.redis.expire(key, max(120, int(window_seconds) + 30))
+        return int(count or 0)
+
+    async def register_signal_send(self, exchange_name: str, symbol: str, window_seconds: int) -> None:
+        if self.redis is None:
+            raise RuntimeError("Redis connection is not initialized; call startup() first")
+        key = "signal_throttle_window"
+        now = int(time.time())
+        member = f"{now}:{exchange_name}:{symbol}:{now % 1000000}"
+        await self.redis.zadd(key, {member: now})
+        await self.redis.zremrangebyscore(key, 0, now - int(window_seconds))
+        await self.redis.expire(key, max(120, int(window_seconds) + 30))
+
+    async def is_pair_blacklisted(self, symbol: str) -> bool:
+        if self.redis is None:
+            raise RuntimeError("Redis connection is not initialized; call startup() first")
+        return bool(await self.redis.get(f"pair_blacklist:{symbol}"))
+
+    async def blacklist_pair(self, symbol: str, ttl_seconds: int = 86400) -> None:
+        if self.redis is None:
+            raise RuntimeError("Redis connection is not initialized; call startup() first")
+        await self.redis.set(f"pair_blacklist:{symbol}", "1", ex=max(300, int(ttl_seconds)))
 
     async def fetch_signals_for_day(self, day_utc) -> List[tuple]:
         if self.pool is None:
@@ -604,10 +777,24 @@ class FortressScanner:
         )
         self._async_thread.start()
 
-        self.scan_interval_seconds = 120
+        self.scan_interval_seconds = int(os.getenv("SCAN_INTERVAL_SECONDS", "5"))
         self.max_symbols = 35
         self.alert_cooldown_seconds = 60 * 60
         self.last_alert_at: Dict[str, float] = {}
+        # Signal pacing controls (anti-burst): spread signals over time.
+        self.min_signal_gap_seconds = int(os.getenv("MIN_SIGNAL_GAP_SECONDS", "45"))
+        self.max_signals_per_cycle = int(os.getenv("MAX_SIGNALS_PER_CYCLE", "6"))
+        self.last_global_signal_sent_at = 0.0
+        self.cycle_signal_sent_count = 0
+        self.signal_pacing_lock = threading.Lock()
+        self.scan_semaphore_size = int(os.getenv("SCAN_CONCURRENCY", "24"))
+        self.fast_ticker_cache_ttl_sec = float(os.getenv("FAST_TICKER_CACHE_TTL_SEC", "2.0"))
+        self.fast_ticker_cache: Dict[str, dict] = {}
+        self.virtual_balance = float(os.getenv("VIRTUAL_BALANCE", "10000"))
+        self.risk_per_trade_pct = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
+        self.max_risk_per_trade_pct = float(os.getenv("MAX_RISK_PER_TRADE_PCT", "2.0"))
+        self.slippage_expire_pct = float(os.getenv("SLIPPAGE_EXPIRE_PCT", "0.5"))
+        self.adx_trend_min = float(os.getenv("ADX_TREND_MIN", "22"))
         # Keep local SQLite only for adaptive learning state.
         self.db_path = self._resolve_learning_db_path()
         self.db_executor = ThreadPoolExecutor(max_workers=1)
@@ -640,16 +827,33 @@ class FortressScanner:
             "date": datetime.now(UTC).strftime("%Y-%m-%d"),
             "chat_sent": 0,
             "vip_plus_sent": 0,
+            "global_sent": 0,
         }
         # Daily delivery targets (can be overridden from env).
-        self.daily_target_chat_signals = int(os.getenv("DAILY_TARGET_CHAT_SIGNALS", "30"))
-        self.daily_target_vip_plus_signals = int(os.getenv("DAILY_TARGET_VIP_PLUS_SIGNALS", "30"))
+        self.daily_target_chat_signals = int(os.getenv("DAILY_TARGET_CHAT_SIGNALS", "25"))
+        self.daily_target_vip_plus_signals = int(os.getenv("DAILY_TARGET_VIP_PLUS_SIGNALS", "15"))
         # Publish when setup confidence meets this threshold (default: 75%).
         self.signal_publish_threshold_pct = float(os.getenv("SIGNAL_PUBLISH_THRESHOLD_PCT", "75"))
         self.signal_publish_threshold_score = max(
             1,
             min(10, int(math.ceil(self.signal_publish_threshold_pct / 10.0))),
         )
+        # Minimum target distances (raw %, before leverage) to block tiny-profit signals.
+        self.min_tp1_pct = float(os.getenv("MIN_TP1_PCT", "0.8"))
+        self.min_tp3_pct = float(os.getenv("MIN_TP3_PCT", "2.0"))
+        self.global_daily_signal_limit = int(os.getenv("GLOBAL_DAILY_SIGNAL_LIMIT", "30"))
+        self.symbol_cooldown_seconds = int(os.getenv("SYMBOL_COOLDOWN_SECONDS", str(4 * 60 * 60)))
+        self.global_throttle_window_sec = int(os.getenv("GLOBAL_THROTTLE_WINDOW_SEC", "600"))
+        self.global_throttle_max_signals = int(os.getenv("GLOBAL_THROTTLE_MAX_SIGNALS", "2"))
+        self.strict_quality_score = int(os.getenv("STRICT_QUALITY_SCORE", "9"))
+        self.min_tp1_distance_pct = float(os.getenv("MIN_TP1_DISTANCE_PCT", "1.5"))
+        self.vip_min_confidence_pct = float(os.getenv("VIP_MIN_CONFIDENCE_PCT", "75"))
+        self.vip_plus_min_confidence_pct = float(os.getenv("VIP_PLUS_MIN_CONFIDENCE_PCT", "89"))
+        self.vip_plus_downgrade_pct = float(os.getenv("VIP_PLUS_DOWNGRADE_PCT", "85"))
+        self.trade_timeout_minutes = int(os.getenv("TRADE_TIMEOUT_MINUTES", "360"))
+        self.exchange_score_penalty: Dict[str, int] = {}
+        self.timeframe_score_penalty: Dict[str, int] = {}
+        self.rsi_weight = float(os.getenv("RSI_WEIGHT", "1.0"))
         print(
             f"[DELIVERY] publish threshold={self.signal_publish_threshold_pct:.1f}% "
             f"(score>={self.signal_publish_threshold_score}/10)"
@@ -685,6 +889,8 @@ class FortressScanner:
         }
 
         self.token = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or "").strip()
+        self.vip_token = (os.getenv("VIP_TELEGRAM_BOT_TOKEN") or self.token).strip()
+        self.vip_plus_token = (os.getenv("VIP_PLUS_TELEGRAM_BOT_TOKEN") or self.vip_token).strip()
         self.chat_id = (os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID") or "").strip()
         self.vip_plus_chat_id = os.getenv("VIP_PLUS_CHAT_ID", "").strip()
         self.admin_chat_id = os.getenv("ADMIN_CHAT_ID", "").strip()
@@ -1444,7 +1650,17 @@ class FortressScanner:
                 print(f"[DB] signal id={signal_id} reached target T{target_hit}")
 
             if not new_status:
-                continue
+                ts = row.get("timestamp")
+                if isinstance(ts, datetime):
+                    opened_at = ts if ts.tzinfo else ts.replace(tzinfo=UTC)
+                else:
+                    opened_at = datetime.now(UTC)
+                age_minutes = (datetime.now(UTC) - opened_at).total_seconds() / 60.0
+                if age_minutes >= float(self.trade_timeout_minutes):
+                    new_status = "Timed Out"
+                    print(f"[DB] signal id={signal_id} timed out after {age_minutes:.0f}m")
+                else:
+                    continue
 
             self._run_async_task(
                 self.trade_manager.update_signal_status(
@@ -1456,11 +1672,12 @@ class FortressScanner:
             print(f"[DB] updated signal id={signal_id} -> {new_status}")
 
     def adaptive_learning_step(self) -> None:
-        """Self-tune thresholds based on recent closed signal performance."""
-        statuses = self._run_async_task(self.trade_manager.fetch_recent_closed_statuses(limit=40))
-        if len(statuses) < 10:
+        """Self-tune thresholds based on the last 50 closed trades."""
+        trades = self._run_async_task(self.trade_manager.fetch_recent_trade_journal(limit=50))
+        if len(trades) < 10:
             return
 
+        statuses = [str(t.get("status") or "") for t in trades]
         wins = sum(1 for s in statuses if s == "Hit TP")
         win_rate = wins / len(statuses)
         old_score = self.min_score_threshold
@@ -1478,6 +1695,65 @@ class FortressScanner:
             print(
                 f"[LEARNING] tuned thresholds | win_rate={win_rate:.2%} | min_score {old_score}->{self.min_score_threshold} | rel_vol {old_vol:.2f}->{self.volume_spike_threshold:.2f}"
             )
+        # Per-exchange / timeframe penalty model.
+        exch_stats: Dict[str, List[str]] = {}
+        tf_stats: Dict[str, List[str]] = {}
+        for t in trades:
+            exch = str(t.get("exchange") or "unknown")
+            tf = str(t.get("timeframe") or "15m")
+            exch_stats.setdefault(exch, []).append(str(t.get("status") or ""))
+            tf_stats.setdefault(tf, []).append(str(t.get("status") or ""))
+        new_ex_pen: Dict[str, int] = {}
+        for exch, vals in exch_stats.items():
+            if len(vals) < 6:
+                continue
+            fail_rate = sum(1 for v in vals if v != "Hit TP") / len(vals)
+            if fail_rate >= 0.60:
+                new_ex_pen[exch] = 1
+            if fail_rate >= 0.72:
+                new_ex_pen[exch] = 2
+        new_tf_pen: Dict[str, int] = {}
+        for tf, vals in tf_stats.items():
+            if len(vals) < 6:
+                continue
+            fail_rate = sum(1 for v in vals if v != "Hit TP") / len(vals)
+            if fail_rate >= 0.60:
+                new_tf_pen[tf] = 1
+            if fail_rate >= 0.72:
+                new_tf_pen[tf] = 2
+        self.exchange_score_penalty = new_ex_pen
+        self.timeframe_score_penalty = new_tf_pen
+        # RSI de-weight if it correlates with false signals.
+        rsi_vals = [float(t.get("rsi_snapshot") or 50.0) for t in trades]
+        losing_idx = [i for i, s in enumerate(statuses) if s == "Hit SL"]
+        if losing_idx:
+            rsi_extreme_losses = sum(1 for i in losing_idx if abs(rsi_vals[i] - 50.0) >= 15.0)
+            ratio = rsi_extreme_losses / len(losing_idx)
+            if ratio >= 0.55:
+                self.rsi_weight = max(0.5, self.rsi_weight - 0.1)
+            elif ratio <= 0.35:
+                self.rsi_weight = min(1.0, self.rsi_weight + 0.05)
+        print(
+            f"[LEARNING] penalties ex={self.exchange_score_penalty} tf={self.timeframe_score_penalty} "
+            f"rsi_weight={self.rsi_weight:.2f}"
+        )
+        # Pair scorecard: auto-blacklist weak pairs for 24h.
+        pair_stats: Dict[str, List[str]] = {}
+        for t in trades:
+            sym = str(t.get("symbol") or "")
+            if not sym:
+                continue
+            pair_stats.setdefault(sym, []).append(str(t.get("status") or ""))
+        for sym, vals in pair_stats.items():
+            if len(vals) < 6:
+                continue
+            sl_ratio = sum(1 for v in vals if v == "Hit SL") / len(vals)
+            if sl_ratio >= 0.5:
+                try:
+                    self._run_async_task(self.trade_manager.blacklist_pair(sym, ttl_seconds=24 * 60 * 60))
+                    print(f"[LEARNING] blacklisted {sym} for 24h (SL ratio={sl_ratio:.2f})")
+                except Exception as exc:
+                    print(f"[LEARNING] blacklist failed for {sym}: {exc}")
 
     def status_watcher_loop(self) -> None:
         while True:
@@ -1737,7 +2013,7 @@ class FortressScanner:
                 return None
             return None
 
-        def _retry_ohlcv(tf: str, lim: int, attempts: int = 3) -> Optional[List[list]]:
+        def _retry_ohlcv(tf: str, lim: int, attempts: int = 4) -> Optional[List[list]]:
             for idx in range(attempts):
                 try:
                     return ex.fetch_ohlcv(symbol, timeframe=tf, limit=lim)
@@ -1757,7 +2033,7 @@ class FortressScanner:
                                 pass
                     if idx == attempts - 1:
                         return None
-                    time.sleep(0.4 * (idx + 1))
+                    time.sleep(min(2.5, 0.25 * (2 ** idx)))
             return None
 
         def _fetch(tf: str, lim: int) -> Tuple[str, Optional[pd.DataFrame]]:
@@ -1776,6 +2052,31 @@ class FortressScanner:
                     return None
                 out[tf] = df
         return out
+
+    def get_realtime_price_fast(self, ex: ccxt.Exchange, symbol: str) -> Optional[float]:
+        key = f"{getattr(ex, 'id', 'ex')}:{symbol}"
+        now = time.time()
+        cached = self.fast_ticker_cache.get(key)
+        if cached and (now - float(cached.get("ts", 0.0))) < self.fast_ticker_cache_ttl_sec:
+            return float(cached.get("price"))
+        try:
+            ticker = ex.fetch_ticker(symbol)
+            px = ticker.get("last") or ticker.get("close")
+            if px is None:
+                return None
+            price = float(px)
+            self.fast_ticker_cache[key] = {"ts": now, "price": price}
+            return price
+        except Exception:
+            return None
+
+    @staticmethod
+    def compute_position_size(entry: float, sl: float, equity: float, risk_pct: float) -> float:
+        risk_usd = max(0.0, float(equity) * (float(risk_pct) / 100.0))
+        risk_per_unit = abs(float(entry) - float(sl))
+        if risk_per_unit <= 0:
+            return 0.0
+        return risk_usd / risk_per_unit
 
     # -------------------------
     # 2) The Intelligence Core
@@ -1802,6 +2103,7 @@ class FortressScanner:
             close=data["close"],
             volume=data["volume"],
         )
+        data["vwma20"] = ta.vwma(data["close"], data["volume"], length=20)
         data["atr"] = ta.atr(data["high"], data["low"], data["close"], length=14)
         macd = ta.macd(data["close"], fast=12, slow=26, signal=9)
         data["macd"] = macd["MACD_12_26_9"] if macd is not None else None
@@ -2632,6 +2934,8 @@ class FortressScanner:
         prev_5 = d5.iloc[-2]
         pivots = self.pivot_levels(d1h)
         price = float(last_5["close"])
+        if float(last_1h["adx"]) < self.adx_trend_min:
+            return None
 
         # Layer 1: HTF filter (4H EMA200) + MSS/BOS on 15m
         trend_up = float(last_4h["close"]) > float(last_4h["ema200"])
@@ -2660,12 +2964,26 @@ class FortressScanner:
         short_osc = (last_15["rsi"] > 70) and (last_15["stoch_k"] < last_15["stoch_d"]) and (last_15["stoch_k"] > 75)
         rsi_recover_long = (float(prev_15["rsi"]) < 30) and (float(last_15["rsi"]) > float(prev_15["rsi"]))
         rsi_recover_short = (float(prev_15["rsi"]) > 70) and (float(last_15["rsi"]) < float(prev_15["rsi"]))
+        rsi_signal_ok = self.rsi_weight >= 0.65
+        if not rsi_signal_ok:
+            long_osc = False
+            short_osc = False
+            rsi_recover_long = False
+            rsi_recover_short = False
         at_support = price <= pivots["s1"] * 1.005
         at_resistance = price >= pivots["r1"] * 0.995
         macd_cross_up = (prev_5["macd"] <= prev_5["macd_signal"]) and (last_5["macd"] > last_5["macd_signal"])
         macd_cross_down = (prev_5["macd"] >= prev_5["macd_signal"]) and (last_5["macd"] < last_5["macd_signal"])
-        vwap_long = float(last_15["close"]) > float(last_15["vwap"]) and float(last_1h["close"]) > float(last_1h["vwap"])
-        vwap_short = float(last_15["close"]) < float(last_15["vwap"]) and float(last_1h["close"]) < float(last_1h["vwap"])
+        vwap_long = (
+            float(last_15["close"]) > float(last_15["vwap"])
+            and float(last_1h["close"]) > float(last_1h["vwap"])
+            and float(last_15.get("vwma20", last_15["close"])) >= float(last_15["ema20"])
+        )
+        vwap_short = (
+            float(last_15["close"]) < float(last_15["vwap"])
+            and float(last_1h["close"]) < float(last_1h["vwap"])
+            and float(last_15.get("vwma20", last_15["close"])) <= float(last_15["ema20"])
+        )
 
         if self.aggressive_signal_mode:
             # Throughput mode: require trend + break + momentum core, while allowing
@@ -2754,6 +3072,18 @@ class FortressScanner:
             bool(abs(price - pivots["pivot"]) / max(price, 1e-9) < 0.02),
         ]
         score_1_10 = max(1, min(10, sum(1 for x in confluence_checks if x)))
+        if self.rsi_weight < 1.0:
+            score_1_10 = max(1, score_1_10 - int(round((1.0 - self.rsi_weight) * 2.0)))
+        indicator_5 = [
+            bool(macd_cross_up or macd_cross_down),
+            bool(vwap_long or vwap_short),
+            bool(float(last_1h["adx"]) >= self.adx_trend_min),
+            bool(long_osc or short_osc or rsi_recover_long or rsi_recover_short),
+            bool((side == "LONG" and price > float(last_15.get("vwma20", last_15["close"]))) or (side == "SHORT" and price < float(last_15.get("vwma20", last_15["close"])))),
+        ]
+        indicator_alignment_count_5 = sum(1 for x in indicator_5 if x)
+        mtf_confluence_ok = bool((side == "LONG" and trend_up) or (side == "SHORT" and trend_down))
+        vwap_institutional_ok = bool(vwap_long if side == "LONG" else vwap_short)
 
         tech_breakdown = []
         if at_support:
@@ -2869,6 +3199,8 @@ class FortressScanner:
             order_book_depth = ob_meta["depth_summary"]
         except Exception:
             order_book_depth = "Unavailable"
+        risk_pct = max(0.1, min(self.max_risk_per_trade_pct, self.risk_per_trade_pct))
+        pos_size = self.compute_position_size(entry=entry, sl=sl, equity=self.virtual_balance, risk_pct=risk_pct)
 
         return {
             "side": side,
@@ -2903,6 +3235,13 @@ class FortressScanner:
             "sync_mtf_status": sync.get("mtf_text", "N/A"),
             "sync_exchange_status": sync.get("exchange_text", "N/A"),
             "sync_oi_status": sync.get("oi_text", "N/A"),
+            "timeframe": "15m",
+            "position_size": float(pos_size),
+            "risk_pct": float(risk_pct),
+            "indicator_alignment_count_5": int(indicator_alignment_count_5),
+            "volume_confirmed": bool(volume_spike),
+            "mtf_confluence_ok": bool(mtf_confluence_ok),
+            "vwap_institutional_ok": bool(vwap_institutional_ok),
             "vip_ok": layered.get("vip_ok", False),
             "vip_plus_ok": layered.get("vip_plus_ok", False),
             "vip_layer_lines": layered.get("vip_layer_lines", []),
@@ -3388,7 +3727,7 @@ class FortressScanner:
             return None
 
     def send_telegram(self, exchange_name: str, symbol: str, setup: dict) -> None:
-        if not self.token:
+        if not self.vip_token:
             print(f"[TELEGRAM] SKIPPED (missing credentials) | {exchange_name} {symbol}")
             return
 
@@ -3397,8 +3736,56 @@ class FortressScanner:
         if key in self.last_alert_at and (now - self.last_alert_at[key]) < self.alert_cooldown_seconds:
             print(f"[ANTI-SPAM] skipped {key} (cooldown 60m)")
             return
+        ex_for_slippage = self.exchanges.get(exchange_name)
+        if ex_for_slippage is not None:
+            live_price = self.get_realtime_price_fast(ex_for_slippage, symbol)
+            entry_px = float(setup.get("entry", 0.0) or 0.0)
+            if live_price and entry_px > 0:
+                slippage_pct = abs((live_price - entry_px) / entry_px) * 100.0
+                if slippage_pct > self.slippage_expire_pct:
+                    print(
+                        f"[EXECUTION] expired {exchange_name} {symbol}: "
+                        f"slippage {slippage_pct:.2f}% > {self.slippage_expire_pct:.2f}%"
+                    )
+                    if setup.get("signal_id") is not None:
+                        try:
+                            self._run_async_task(
+                                self.trade_manager.update_signal_status(
+                                    signal_id=int(setup["signal_id"]),
+                                    status="Expired",
+                                    last_price=float(live_price),
+                                )
+                            )
+                        except Exception:
+                            pass
+                    return
+        self._refresh_daily_flow_state()
+        now_il = datetime.now(self.il_tz)
+        sec_of_day = (now_il.hour * 3600) + (now_il.minute * 60) + now_il.second
+        day_progress = min(1.0, max(0.0, sec_of_day / 86400.0))
+        sent_today = int(self.daily_flow.get("chat_sent", 0))
+        expected_by_now = self.daily_target_chat_signals * day_progress
+        adaptive_gap_seconds = self.min_signal_gap_seconds
+        if sent_today < (expected_by_now - 2):
+            adaptive_gap_seconds = max(12, int(self.min_signal_gap_seconds * 0.6))
+        elif sent_today > (expected_by_now + 2):
+            adaptive_gap_seconds = int(self.min_signal_gap_seconds * 1.5)
+        with self.signal_pacing_lock:
+            if self.max_signals_per_cycle > 0 and self.cycle_signal_sent_count >= self.max_signals_per_cycle:
+                print(
+                    f"[PACING] skipped {exchange_name} {symbol}: cycle cap reached "
+                    f"({self.cycle_signal_sent_count}/{self.max_signals_per_cycle})"
+                )
+                return
+            since_last = now - self.last_global_signal_sent_at
+            if since_last < adaptive_gap_seconds:
+                print(
+                    f"[PACING] skipped {exchange_name} {symbol}: waiting gap "
+                    f"{since_last:.1f}/{adaptive_gap_seconds}s"
+                )
+                return
 
-        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        url = f"https://api.telegram.org/bot{self.vip_token}/sendMessage"
         try:
             signal_id_opt: Optional[int] = None
             try:
@@ -3475,7 +3862,11 @@ class FortressScanner:
                 include_live_button: bool = False,
                 force_text: bool = False,
                 parse_mode: Optional[str] = None,
+                token: Optional[str] = None,
             ) -> Optional[int]:
+                use_token = (token or self.vip_token or self.token).strip()
+                if not use_token:
+                    return None
                 live_symbol = symbol.replace("/", "")
                 live_url = (
                     f"https://www.binance.com/en/trade/{live_symbol}"
@@ -3509,7 +3900,7 @@ class FortressScanner:
                     if reply_markup:
                         data_payload["reply_markup"] = json.dumps(reply_markup)
                     resp = requests.post(
-                        f"https://api.telegram.org/bot{self.token}/sendPhoto",
+                        f"https://api.telegram.org/bot{use_token}/sendPhoto",
                         data=data_payload,
                         files={"photo": ("fortress_chart.png", vip_chart_image_bytes, "image/png")},
                         timeout=30,
@@ -3521,7 +3912,7 @@ class FortressScanner:
                     if reply_markup:
                         json_payload["reply_markup"] = reply_markup
                     resp = requests.post(
-                        url,
+                        f"https://api.telegram.org/bot{use_token}/sendMessage",
                         json=json_payload,
                         timeout=20,
                     )
@@ -3542,7 +3933,13 @@ class FortressScanner:
             vip_quality = bool(setup.get("vip_ok", False))
             vip_soft = bool(setup.get("vip_soft_ok", False))
             setup_score = int(setup.get("score", 0))
-            score_qualified = setup_score >= self.signal_publish_threshold_score
+            signal_strength = max(80, min(99, int(setup_score * 10)))
+            indicator_align = int(setup.get("indicator_alignment_count_5", 0))
+            volume_ok = bool(setup.get("volume_confirmed", False))
+            mtf_ok = bool(setup.get("mtf_confluence_ok", False))
+            vwap_ok = bool(setup.get("vwap_institutional_ok", False))
+            vip_logic_ok = indicator_align >= 3 and volume_ok
+            vip_plus_logic_ok = indicator_align >= 5 and mtf_ok and vwap_ok and volume_ok
 
             # Dynamic daily target windows tuned for higher daily throughput.
             vip_plus_sent_today = int(self.daily_flow.get("vip_plus_sent", 0))
@@ -3585,10 +3982,22 @@ class FortressScanner:
             if not vip_plus_channel_on:
                 allow_vip_plus = False
 
-            # Throughput mode: any setup above configured confidence threshold is publishable.
-            if score_qualified:
-                allow_vip_chat = bool(vip_channel_on)
-                allow_vip_plus = bool(vip_plus_channel_on and self.vip_plus_chat_id)
+            allow_vip_chat = bool(
+                allow_vip_chat
+                and vip_channel_on
+                and vip_logic_ok
+                and signal_strength >= self.vip_min_confidence_pct
+            )
+            allow_vip_plus = bool(
+                allow_vip_plus
+                and vip_plus_channel_on
+                and self.vip_plus_chat_id
+                and vip_plus_logic_ok
+                and signal_strength >= self.vip_plus_min_confidence_pct
+            )
+            if allow_vip_plus and signal_strength < self.vip_plus_downgrade_pct:
+                allow_vip_plus = False
+                allow_vip_chat = bool(allow_vip_chat or (vip_channel_on and vip_logic_ok))
 
             # VIP+ gets only 99%-tier confirmations (layers 1-8 all pass).
             if self.vip_plus_chat_id and allow_vip_plus:
@@ -3597,6 +4006,7 @@ class FortressScanner:
                     vip_caption,
                     include_live_button=True,
                     parse_mode="MarkdownV2",
+                    token=self.vip_plus_token,
                 )
                 if msg_id:
                     self.vip_signal_count += 1
@@ -3613,7 +4023,13 @@ class FortressScanner:
                     setup["original_message_saved"] = True
                 else:
                     # Fallback: ensure VIP+ still receives signal if photo flow failed.
-                    fallback_msg_id = _send(self.vip_plus_chat_id, vip_caption, include_live_button=False, force_text=True)
+                    fallback_msg_id = _send(
+                        self.vip_plus_chat_id,
+                        vip_caption,
+                        include_live_button=False,
+                        force_text=True,
+                        token=self.vip_plus_token,
+                    )
                     if fallback_msg_id:
                         self.vip_signal_count += 1
                         self.daily_flow["vip_plus_sent"] = vip_plus_sent_today + 1
@@ -3643,6 +4059,7 @@ class FortressScanner:
                     chat_base_caption,
                     include_live_button=True,
                     parse_mode="MarkdownV2",
+                    token=self.vip_token,
                 )
                 if msg_id:
                     self.chat_signal_count += 1
@@ -3661,6 +4078,27 @@ class FortressScanner:
 
             if sent_any:
                 self.last_alert_at[key] = now
+                with self.signal_pacing_lock:
+                    self.last_global_signal_sent_at = now
+                    self.cycle_signal_sent_count += 1
+                self.daily_flow["global_sent"] = int(self.daily_flow.get("global_sent", 0)) + 1
+                try:
+                    self._run_async_task(
+                        self.trade_manager.mark_symbol_cooldown(
+                            exchange_name=exchange_name,
+                            symbol=symbol,
+                            cooldown_seconds=self.symbol_cooldown_seconds,
+                        )
+                    )
+                    self._run_async_task(
+                        self.trade_manager.register_signal_send(
+                            exchange_name=exchange_name,
+                            symbol=symbol,
+                            window_seconds=self.global_throttle_window_sec,
+                        )
+                    )
+                except Exception as exc:
+                    print(f"[PACING] cooldown/throttle register failed: {exc}")
                 print(
                     f"[TELEGRAM] SENT routed signal | {exchange_name} {symbol} | score={setup['score']}/10 | vip={self.vip_signal_count} chat={self.chat_signal_count}"
                 )
@@ -3679,13 +4117,78 @@ class FortressScanner:
     # 5) Technical Optimization + DB integration
     # -------------------------
     def process_symbol(self, exchange_name: str, ex: ccxt.Exchange, symbol: str) -> None:
+        self._refresh_daily_flow_state()
+        if int(self.daily_flow.get("global_sent", 0)) >= self.global_daily_signal_limit:
+            return
+        try:
+            if self._run_async_task(self.trade_manager.is_pair_blacklisted(symbol)):
+                print(f"[QUALITY] skipped {exchange_name} {symbol} (blacklisted 24h)")
+                return
+        except Exception:
+            pass
+        try:
+            if self._run_async_task(
+                self.trade_manager.is_symbol_on_cooldown(exchange_name=exchange_name, symbol=symbol)
+            ):
+                print(f"[COOLDOWN] skipped {exchange_name} {symbol} (symbol cooldown active)")
+                return
+            sent_in_window = self._run_async_task(
+                self.trade_manager.count_signals_last_window(self.global_throttle_window_sec)
+            )
+            if int(sent_in_window) >= self.global_throttle_max_signals:
+                print(
+                    f"[THROTTLE] skipped {exchange_name} {symbol} "
+                    f"(window {sent_in_window}/{self.global_throttle_max_signals} in {self.global_throttle_window_sec}s)"
+                )
+                return
+        except Exception as exc:
+            print(f"[THROTTLE] redis gating unavailable, continuing: {exc}")
         data = self.fetch_multi_timeframes(ex, symbol)
         if not data:
+            return
+        fast_price = self.get_realtime_price_fast(ex, symbol)
+        if fast_price and fast_price > 0:
+            for tf in ("5m", "15m"):
+                if tf in data and (not data[tf].empty):
+                    data[tf].iat[-1, data[tf].columns.get_loc("close")] = float(fast_price)
+                    if float(data[tf].iloc[-1]["high"]) < float(fast_price):
+                        data[tf].iat[-1, data[tf].columns.get_loc("high")] = float(fast_price)
+                    if float(data[tf].iloc[-1]["low"]) > float(fast_price):
+                        data[tf].iat[-1, data[tf].columns.get_loc("low")] = float(fast_price)
+        # Institutional MTF confluence: 5m idea must align with 15m and 1h trend.
+        d15 = self.add_indicators(data["15m"])
+        d1h = self.add_indicators(data["1h"])
+        if d15.empty or d1h.empty:
             return
         setup = self.detect_setup(ex, symbol, data)
         if (not setup) and self.aggressive_signal_mode:
             setup = self.build_aggressive_fallback_setup(data)
         if not setup:
+            return
+        side = str(setup.get("side", "LONG"))
+        mtf_long_ok = float(d15.iloc[-1]["close"]) > float(d15.iloc[-1]["ema50"]) and float(d1h.iloc[-1]["close"]) > float(d1h.iloc[-1]["ema50"])
+        mtf_short_ok = float(d15.iloc[-1]["close"]) < float(d15.iloc[-1]["ema50"]) and float(d1h.iloc[-1]["close"]) < float(d1h.iloc[-1]["ema50"])
+        if (side == "LONG" and not mtf_long_ok) or (side == "SHORT" and not mtf_short_ok):
+            print(f"[QUALITY] skipped {exchange_name} {symbol} (MTF trend not aligned)")
+            return
+        tf_key = str(setup.get("timeframe", "15m"))
+        penalty = int(self.exchange_score_penalty.get(exchange_name, 0)) + int(
+            self.timeframe_score_penalty.get(tf_key, 0)
+        )
+        if penalty > 0:
+            setup["score"] = max(1, int(setup.get("score", 0)) - penalty)
+        setup_score = int(setup.get("score", 0))
+        strict_alignment = bool(setup.get("vip_plus_ok", False)) or (
+            bool(setup.get("vip_ok", False))
+            and float(setup.get("rr", 0.0)) >= 2.5
+            and float(setup.get("rel_volume", 0.0)) >= 1.6
+            and float(setup.get("adx", 0.0)) >= 20.0
+        )
+        if setup_score < self.strict_quality_score and (not strict_alignment):
+            print(
+                f"[QUALITY] skipped {exchange_name} {symbol} "
+                f"(score={setup_score}/10 strict={self.strict_quality_score}/10 align={strict_alignment})"
+            )
             return
         # Adaptive floor: when daily flow is below target, allow slightly lower score floor.
         self._refresh_daily_flow_state()
@@ -3694,10 +4197,57 @@ class FortressScanner:
             adaptive_floor = max(5, self.min_score_threshold - 1)
         if int(setup["score"]) < adaptive_floor:
             return
+        entry_val = float(setup.get("entry", 0.0) or 0.0)
+        tp1_val = float(setup.get("tp1", 0.0) or 0.0)
+        if entry_val > 0 and tp1_val > 0:
+            tp1_distance_pct = abs((tp1_val - entry_val) / entry_val) * 100.0
+            if tp1_distance_pct < self.min_tp1_distance_pct:
+                print(
+                    f"[QUALITY] skipped {exchange_name} {symbol} "
+                    f"(tp1 distance {tp1_distance_pct:.2f}% < min {self.min_tp1_distance_pct:.2f}%)"
+                )
+                return
+        entry = float(setup.get("entry", 0.0) or 0.0)
+        tp1 = float(setup.get("tp1", 0.0) or 0.0)
+        tp3 = float(setup.get("tp3", 0.0) or 0.0)
+        if entry > 0 and tp1 > 0 and tp3 > 0:
+            tp1_move_pct = abs((tp1 - entry) / entry) * 100.0
+            tp3_move_pct = abs((tp3 - entry) / entry) * 100.0
+            if tp1_move_pct < self.min_tp1_pct or tp3_move_pct < self.min_tp3_pct:
+                print(
+                    f"[RISK] skipped {symbol}: tiny targets "
+                    f"(tp1={tp1_move_pct:.2f}% tp3={tp3_move_pct:.2f}%) "
+                    f"< min(tp1={self.min_tp1_pct:.2f}% tp3={self.min_tp3_pct:.2f}%)"
+                )
+                return
 
         if self.has_recent_signal(symbol, minutes=30):
             print(f"[DB-MEMORY] skipped {symbol} (signal exists in last 30m)")
             return
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
+        total_today, lowest_pending = self._run_async_task(
+            self.trade_manager.get_daily_count_and_lowest_pending(today)
+        )
+        if total_today >= self.global_daily_signal_limit:
+            if (not lowest_pending) or setup_score <= int(lowest_pending.get("score") or 0):
+                print(
+                    f"[CAP] skipped {exchange_name} {symbol}: cap reached "
+                    f"({total_today}/{self.global_daily_signal_limit})"
+                )
+                return
+            replace_id = int(lowest_pending["id"])
+            replace_last = float(lowest_pending.get("last_price") or lowest_pending.get("entry_price") or 0.0)
+            self._run_async_task(
+                self.trade_manager.update_signal_status(
+                    signal_id=replace_id,
+                    status="Replaced",
+                    last_price=replace_last,
+                )
+            )
+            print(
+                f"[CAP] replaced pending signal id={replace_id} "
+                f"score={int(lowest_pending.get('score') or 0)} with {symbol} score={setup_score}"
+            )
 
         signal_id = self.save_signal(exchange_name, symbol, setup)
         setup["signal_id"] = int(signal_id)
@@ -3730,9 +4280,20 @@ class FortressScanner:
             tp1 = price + (1.2 * risk) if side == "LONG" else price - (1.2 * risk)
             tp2 = price + (2.0 * risk) if side == "LONG" else price - (2.0 * risk)
             tp3 = price + (3.0 * risk) if side == "LONG" else price - (3.0 * risk)
+            # Ensure fallback targets are meaningful in percentage terms.
+            if side == "LONG":
+                tp1 = max(tp1, price * (1 + self.min_tp1_pct / 100.0))
+                tp2 = max(tp2, price * (1 + max(1.3, self.min_tp1_pct * 1.6) / 100.0))
+                tp3 = max(tp3, price * (1 + self.min_tp3_pct / 100.0))
+            else:
+                tp1 = min(tp1, price * (1 - self.min_tp1_pct / 100.0))
+                tp2 = min(tp2, price * (1 - max(1.3, self.min_tp1_pct * 1.6) / 100.0))
+                tp3 = min(tp3, price * (1 - self.min_tp3_pct / 100.0))
             potential_gain_pct = abs((tp3 - price) / max(price, 1e-9)) * 100
             potential_loss_pct = abs((price - sl) / max(price, 1e-9)) * 100
             rr = potential_gain_pct / max(potential_loss_pct, 1e-9)
+            risk_pct = max(0.1, min(self.max_risk_per_trade_pct, self.risk_per_trade_pct))
+            pos_size = self.compute_position_size(entry=price, sl=sl, equity=self.virtual_balance, risk_pct=risk_pct)
 
             return {
                 "side": side,
@@ -3771,6 +4332,9 @@ class FortressScanner:
                 "levels_detailed": "Entry/SL/TP derived from ATR dynamics on live 5m-1h structure.",
                 "indicators_detailed": "EMA50 trend alignment with RSI/volume baseline checks.",
                 "risk_detailed": "Reduced strict gating mode: manage size conservatively.",
+                "timeframe": "15m",
+                "position_size": float(pos_size),
+                "risk_pct": float(risk_pct),
             }
         except Exception:
             return None
@@ -3778,7 +4342,7 @@ class FortressScanner:
     def _refresh_daily_flow_state(self) -> None:
         today = datetime.now(UTC).strftime("%Y-%m-%d")
         if self.daily_flow.get("date") != today:
-            self.daily_flow = {"date": today, "chat_sent": 0, "vip_plus_sent": 0}
+            self.daily_flow = {"date": today, "chat_sent": 0, "vip_plus_sent": 0, "global_sent": 0}
 
     def scan_exchange(self, exchange_name: str, ex: ccxt.Exchange) -> None:
         symbols = self.top_usdt_symbols(exchange_name, ex)
@@ -3804,10 +4368,52 @@ class FortressScanner:
                 first_error=(first_error or ""),
             )
 
+    async def _process_symbol_async(
+        self,
+        exchange_name: str,
+        ex: ccxt.Exchange,
+        symbol: str,
+        sem: asyncio.Semaphore,
+    ) -> Optional[Exception]:
+        async with sem:
+            try:
+                await asyncio.to_thread(self.process_symbol, exchange_name, ex, symbol)
+                return None
+            except Exception as exc:
+                return exc
+
+    async def scan_exchange_async(self, exchange_name: str, ex: ccxt.Exchange, sem: asyncio.Semaphore) -> None:
+        symbols = await asyncio.to_thread(self.top_usdt_symbols, exchange_name, ex)
+        if not symbols:
+            return
+        tasks = [
+            asyncio.create_task(self._process_symbol_async(exchange_name, ex, symbol, sem))
+            for symbol in symbols
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        worker_failures = 0
+        first_error: Optional[str] = None
+        for r in results:
+            if r is None:
+                continue
+            worker_failures += 1
+            if first_error is None:
+                first_error = str(r)
+            print(f"[{exchange_name}] symbol worker failed: {r}")
+        if worker_failures > 0:
+            self.notify_worker_failure_once(
+                exchange_name=exchange_name,
+                failed=worker_failures,
+                total=len(symbols),
+                first_error=(first_error or ""),
+            )
+
     def run_cycle(self) -> None:
         if not self._run_async_task(self.trade_manager.is_bot_active()):
             print("[ENGINE] BOT_ACTIVE=false, skipping cycle")
             return
+        with self.signal_pacing_lock:
+            self.cycle_signal_sent_count = 0
         print("\n=== Fortress Scanner v1.2 cycle started ===")
         with ThreadPoolExecutor(max_workers=2) as pool:
             jobs = [pool.submit(self.scan_exchange, name, ex) for name, ex in self.exchanges.items()]
@@ -3822,10 +4428,32 @@ class FortressScanner:
                     )
         print("=== Fortress Scanner cycle completed ===")
 
+    async def run_cycle_async(self) -> None:
+        if not await self.trade_manager.is_bot_active():
+            print("[ENGINE] BOT_ACTIVE=false, skipping cycle")
+            return
+        with self.signal_pacing_lock:
+            self.cycle_signal_sent_count = 0
+        print("\n=== Fortress Scanner v1.2 cycle started ===")
+        sem = asyncio.Semaphore(max(4, self.scan_semaphore_size))
+        jobs = [
+            asyncio.create_task(self.scan_exchange_async(name, ex, sem))
+            for name, ex in self.exchanges.items()
+        ]
+        results = await asyncio.gather(*jobs, return_exceptions=True)
+        for res in results:
+            if isinstance(res, Exception):
+                print(f"[ENGINE] exchange worker failed: {res}")
+                self.send_admin_notification(
+                    f"Engine exchange worker failed: {res}",
+                    loud=True,
+                )
+        print("=== Fortress Scanner cycle completed ===")
+
     def run_forever(self) -> None:
         while True:
             try:
-                self.run_cycle()
+                self._run_async_task(self.run_cycle_async())
             except Exception as exc:
                 print(f"[FATAL] cycle error: {exc}")
                 self._notify_if_infra_error(exc, "run_forever")
