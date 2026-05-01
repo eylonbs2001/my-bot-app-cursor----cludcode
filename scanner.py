@@ -40,9 +40,9 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 try:
-    import pandas_ta as ta
-except Exception:
     import pandas_ta_classic as ta
+except Exception:
+    import pandas_ta as ta
 
 load_dotenv()
 
@@ -83,8 +83,13 @@ class TradeManager:
         self.redis: Optional[redis_async.Redis] = None
 
     async def startup(self) -> List[dict]:
-        if os.getenv("DATABASE_URL"):
-            print(f"DEBUG: Connecting to DB using URL: {os.getenv('DATABASE_URL')[:20]}...")
+        if self.db_url:
+            print("[POSTGRES] connecting via DATABASE_URL/DB_URL (dsn)")
+        else:
+            print(
+                f"[POSTGRES] connecting host={self.pg_host} port={self.pg_port} "
+                f"db={self.pg_database} user={self.pg_user}"
+            )
         # Pool config tuned for managed Postgres (Railway, Supabase, RDS) which
         # silently drop idle connections. max_inactive_connection_lifetime
         # forces asyncpg to retire connections before the server kills them
@@ -113,18 +118,20 @@ class TradeManager:
             raise RuntimeError("Postgres pool is not initialized; call startup() first")
         async with self.pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
-        print("PostgreSQL Connected")
-        if os.getenv("REDIS_URL"):
-            print(f"DEBUG: Connecting to Redis using URL: {os.getenv('REDIS_URL')[:20]}...")
+        print("[POSTGRES] ok (probe SELECT 1)")
+        if self._redis_url_explicit:
+            print("[REDIS] connecting (url from env)")
+        else:
+            print("[REDIS] connecting (built-in fallback; set REDIS_URL in production)")
         self.redis = redis_async.from_url(self.redis_url, decode_responses=True)
         if self.redis is None:
             raise RuntimeError("Redis connection is not initialized; call startup() first")
         try:
             await self.redis.ping()
-            print("Redis Connected")
+            print("[REDIS] ok (PING)")
         except Exception as exc:
             print(
-                f"[WARN] Redis unavailable ({exc}). "
+                f"[REDIS] unavailable ({exc}). "
                 "Continuing without Redis cache/state. Set REDIS_REQUIRED=true to fail fast."
             )
             self.redis = None
@@ -804,8 +811,9 @@ class FortressScanner:
         self.last_daily_report_sent_date_utc: Optional[str] = None
         self.min_score_threshold = 5
         self.volume_spike_threshold = 1.3
-        self.vip_signal_count = 0
-        self.chat_signal_count = 0
+        # Lifetime Telegram send counters (for logs only). VIP+ uses vip_plus_messages_sent.
+        self.vip_plus_messages_sent = 0
+        self.vip_channel_messages_sent = 0
         self.macro_cache: Dict[str, dict] = {}
         self.macro_cache_ttl_sec = 300
         self.sync_cache: Dict[str, dict] = {}
@@ -910,18 +918,18 @@ class FortressScanner:
         if self.openai_api_key:
             try:
                 self.openai_client = OpenAI(api_key=self.openai_api_key)
-                print("[OPENAI] message styling enabled")
+                print("[OPENAI] client ready")
             except Exception as exc:
                 print(f"[OPENAI] init failed: {exc}")
         self.last_heartbeat_hour_il: Optional[str] = None
         if self.token and self.chat_id:
-            print(f"[TELEGRAM] credentials loaded (chat_id={self.chat_id})")
+            print(f"[TG] main channel ok (TELEGRAM_CHAT_ID={self.chat_id})")
         else:
-            print("[TELEGRAM] missing TELEGRAM_BOT_TOKEN/TELEGRAM_TOKEN or TELEGRAM_CHAT_ID/CHAT_ID in .env")
+            print("[TG] missing TELEGRAM_BOT_TOKEN/TELEGRAM_TOKEN or TELEGRAM_CHAT_ID/CHAT_ID")
         if self.vip_plus_chat_id:
-            print(f"[TELEGRAM] VIP+ channel loaded (vip_chat_id={self.vip_plus_chat_id})")
+            print(f"[TG] VIP+ destination ok (VIP_PLUS_CHAT_ID={self.vip_plus_chat_id})")
         if self.admin_chat_id:
-            print(f"[TELEGRAM] admin channel loaded (admin_chat_id={self.admin_chat_id})")
+            print(f"[TG] ADMIN_CHAT_ID set={self.admin_chat_id} (alerts use ADMIN_ID when set)")
         if not self.alert_chat_id:
             print(
                 "[ADMIN] private alerts disabled: set ADMIN_ID (recommended) "
@@ -937,7 +945,7 @@ class FortressScanner:
         self.trade_manager = TradeManager()
         try:
             recovered = self._run_async_task(self.trade_manager.startup())
-            print(f"[TRADE-MANAGER] connected | recovered active trades: {len(recovered)}")
+            print(f"[TRADE] persistence ready | open signals recovered: {len(recovered)}")
 
             self.init_db()
             self.load_learning_state()
@@ -983,7 +991,7 @@ class FortressScanner:
                 conn.commit()
 
         self.db_executor.submit(_create).result()
-        print(f"[LEARNING-DB] ready at {self.db_path}")
+        print(f"[LEARN] sqlite state file ready path={self.db_path}")
 
     @staticmethod
     def _resolve_learning_db_path() -> str:
@@ -1053,12 +1061,12 @@ class FortressScanner:
         cooldown_min = max(1, self.infra_alert_cooldown_sec // 60)
         error_text = str(exc).strip() or exc.__class__.__name__
         message = (
-            "תקלה בתשתית הבוט (התרעה מרוכזת)\n"
-            f"רכיב: {'PostgreSQL' if component == 'database' else 'Redis'}\n"
-            f"מיקום: {context}\n"
-            f"שגיאה: {error_text[:500]}\n"
-            f"פעולה אוטומטית: הבוט ימשיך לנסות התחברות מחדש בלופים הבאים.\n"
-            f"מניעת ספאם פעילה: תישלח התרעה נוספת רק בעוד כ-{cooldown_min} דקות."
+            "Bot infrastructure issue (aggregated alert)\n"
+            f"Component: {'PostgreSQL' if component == 'database' else 'Redis'}\n"
+            f"Context: {context}\n"
+            f"Error: {error_text[:500]}\n"
+            "Auto-recovery: the bot will keep retrying on the next cycles.\n"
+            f"Anti-spam: next alert in ~{cooldown_min} minutes."
         )
         self.send_admin_notification(message, loud=True)
 
@@ -1077,12 +1085,12 @@ class FortressScanner:
         self._infra_alert_last_sent[component_key] = now
         cooldown_min = max(1, self.infra_alert_cooldown_sec // 60)
         msg = (
-            "תקלה מרוכזת במנוע הסריקה\n"
-            f"בורסה: {exchange_name}\n"
-            f"עובדים שנכשלו: {failed}/{total}\n"
-            f"שגיאה ראשונה: {(first_error or 'לא זוהתה שגיאה')[:500]}\n"
-            "הערה: ההתרעה נשלחת אך ורק לאדמין בצ'אט פרטי.\n"
-            f"מניעת ספאם פעילה: הודעה נוספת תישלח רק בעוד כ-{cooldown_min} דקות."
+            "Scanner engine issue (aggregated)\n"
+            f"Exchange: {exchange_name}\n"
+            f"Failed workers: {failed}/{total}\n"
+            f"First error: {(first_error or 'unknown')[:500]}\n"
+            "Note: this alert is sent only to the admin private chat.\n"
+            f"Anti-spam: next message in ~{cooldown_min} minutes."
         )
         self.send_admin_notification(msg, loud=True)
 
@@ -1106,7 +1114,7 @@ class FortressScanner:
             requests.post(
                 f"https://api.telegram.org/bot{self.token}/setMyCommands",
                 json={
-                    "commands": [{"command": "admin", "description": "ממשק ניהול"}],
+                    "commands": [{"command": "admin", "description": "Admin panel"}],
                     "scope": {"type": "chat", "chat_id": str(self.admin_user_id)},
                 },
                 timeout=15,
@@ -1135,25 +1143,37 @@ class FortressScanner:
         bot_on = settings.get("BOT_ACTIVE", "true").lower() == "true"
         keyboard = {
             "inline_keyboard": [
-                [{"text": "📊 סטטיסטיקה", "callback_data": "admin_stats"}, {"text": "👥 משתמשים", "callback_data": "admin_users"}],
-                [{"text": "🛑 עצירת חירום", "callback_data": "admin_stop"}],
-                [{"text": f"📡 VIP: {'ON' if vip_on else 'OFF'}", "callback_data": "admin_toggle_vip"},
-                 {"text": f"🚀 VIP+: {'ON' if vip_plus_on else 'OFF'}", "callback_data": "admin_toggle_vip_plus"}],
-                [{"text": f"🧾 דוח יומי: {'ON' if daily_on else 'OFF'}", "callback_data": "admin_toggle_daily"},
-                 {"text": f"🎯 Replies: {'ON' if target_on else 'OFF'}", "callback_data": "admin_toggle_target"}],
-                [{"text": "🧪 טסט VIP", "callback_data": "admin_test_vip"},
-                 {"text": "🧪 טסט VIP+", "callback_data": "admin_test_vip_plus"}],
-                [{"text": "📈 שלח דוח עכשיו", "callback_data": "admin_send_daily_now"}],
-                [{"text": "📢 שידור הודעה", "callback_data": "admin_broadcast"}],
+                [
+                    {"text": "Stats", "callback_data": "admin_stats"},
+                    {"text": "Users", "callback_data": "admin_users"},
+                ],
+                [{"text": "Emergency stop", "callback_data": "admin_stop"}],
+                [
+                    {"text": f"VIP: {'ON' if vip_on else 'OFF'}", "callback_data": "admin_toggle_vip"},
+                    {
+                        "text": f"VIP+: {'ON' if vip_plus_on else 'OFF'}",
+                        "callback_data": "admin_toggle_vip_plus",
+                    },
+                ],
+                [
+                    {"text": f"Daily: {'ON' if daily_on else 'OFF'}", "callback_data": "admin_toggle_daily"},
+                    {"text": f"Replies: {'ON' if target_on else 'OFF'}", "callback_data": "admin_toggle_target"},
+                ],
+                [
+                    {"text": "Test VIP", "callback_data": "admin_test_vip"},
+                    {"text": "Test VIP+", "callback_data": "admin_test_vip_plus"},
+                ],
+                [{"text": "Send daily now", "callback_data": "admin_send_daily_now"}],
+                [{"text": "Broadcast", "callback_data": "admin_broadcast"}],
             ]
         }
         payload = {
             "chat_id": str(self.admin_user_id),
             "text": (
-                "🛡️ *לוח ניהול*\n"
-                f"מצב בוט: {'פעיל' if bot_on else 'מושבת'}\n"
+                "*Admin dashboard*\n"
+                f"Bot: {'ENABLED' if bot_on else 'DISABLED'}\n"
                 f"VIP={'ON' if vip_on else 'OFF'} | VIP+={'ON' if vip_plus_on else 'OFF'}\n"
-                f"דוח יומי={'ON' if daily_on else 'OFF'} | Replies={'ON' if target_on else 'OFF'}"
+                f"Daily={'ON' if daily_on else 'OFF'} | Replies={'ON' if target_on else 'OFF'}"
             ),
             "parse_mode": "Markdown",
             "reply_markup": keyboard,
@@ -1177,10 +1197,10 @@ class FortressScanner:
             return
 
         chat_id = str((msg.get("chat") or {}).get("id") or self.admin_user_id)
-        response_text = "בוצע"
+        response_text = "Done"
         if data == "admin_stats":
             total_active, win_rate = self._run_async_task(self.trade_manager.get_admin_stats())
-            response_text = f"📊 סטטיסטיקה\nסה״כ עסקאות פעילות: {total_active}\nאחוז הצלחה: {win_rate:.2f}%"
+            response_text = f"Stats\nActive trades: {total_active}\nWin rate: {win_rate:.2f}%"
             requests.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
                 json={"chat_id": chat_id, "text": response_text},
@@ -1188,7 +1208,7 @@ class FortressScanner:
             )
         elif data == "admin_users":
             users_count = self._run_async_task(self.trade_manager.count_users())
-            response_text = f"👥 משתמשים ייחודיים: {users_count}"
+            response_text = f"Unique users: {users_count}"
             requests.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
                 json={"chat_id": chat_id, "text": response_text},
@@ -1198,7 +1218,7 @@ class FortressScanner:
             active = self._run_async_task(self.trade_manager.is_bot_active())
             new_state = not active
             self._run_async_task(self.trade_manager.set_bot_active(new_state))
-            response_text = f"🛑 מצב בוט: {'פעיל' if new_state else 'מושבת'}"
+            response_text = f"Bot: {'ENABLED' if new_state else 'DISABLED'}"
             requests.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
                 json={"chat_id": chat_id, "text": response_text},
@@ -1206,7 +1226,7 @@ class FortressScanner:
             )
         elif data == "admin_broadcast":
             self.admin_pending_broadcast = True
-            response_text = "📢 שלח עכשיו את הודעת השידור."
+            response_text = "Send your broadcast message now."
             requests.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
                 json={"chat_id": chat_id, "text": response_text},
@@ -1217,7 +1237,7 @@ class FortressScanner:
             self._run_async_task(self.trade_manager.set_setting("CHANNEL_VIP_ACTIVE", "false" if v else "true"))
             requests.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": chat_id, "text": f"📡 VIP {'OFF' if v else 'ON'}"},
+                json={"chat_id": chat_id, "text": f"VIP channel {'OFF' if v else 'ON'}"},
                 timeout=20,
             )
             self.send_admin_dashboard()
@@ -1226,7 +1246,7 @@ class FortressScanner:
             self._run_async_task(self.trade_manager.set_setting("CHANNEL_VIP_PLUS_ACTIVE", "false" if v else "true"))
             requests.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": chat_id, "text": f"🚀 VIP+ {'OFF' if v else 'ON'}"},
+                json={"chat_id": chat_id, "text": f"VIP+ channel {'OFF' if v else 'ON'}"},
                 timeout=20,
             )
             self.send_admin_dashboard()
@@ -1235,7 +1255,7 @@ class FortressScanner:
             self._run_async_task(self.trade_manager.set_setting("DAILY_SUMMARY_ACTIVE", "false" if v else "true"))
             requests.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": chat_id, "text": f"🧾 דוח יומי {'OFF' if v else 'ON'}"},
+                json={"chat_id": chat_id, "text": f"Daily report {'OFF' if v else 'ON'}"},
                 timeout=20,
             )
             self.send_admin_dashboard()
@@ -1244,30 +1264,30 @@ class FortressScanner:
             self._run_async_task(self.trade_manager.set_setting("TARGET_REPLY_ACTIVE", "false" if v else "true"))
             requests.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": chat_id, "text": f"🎯 Replies {'OFF' if v else 'ON'}"},
+                json={"chat_id": chat_id, "text": f"Target replies {'OFF' if v else 'ON'}"},
                 timeout=20,
             )
             self.send_admin_dashboard()
         elif data == "admin_test_vip":
             requests.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": str(self.chat_id), "text": "🧪 בדיקת VIP מהאדמין"},
+                json={"chat_id": str(self.chat_id), "text": "Admin VIP test ping"},
                 timeout=20,
             )
             requests.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": chat_id, "text": "✅ נשלח טסט ל-VIP"},
+                json={"chat_id": chat_id, "text": "VIP test sent"},
                 timeout=20,
             )
         elif data == "admin_test_vip_plus":
             requests.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": str(self.vip_plus_chat_id), "text": "🧪 בדיקת VIP+ מהאדמין"},
+                json={"chat_id": str(self.vip_plus_chat_id), "text": "Admin VIP+ test ping"},
                 timeout=20,
             )
             requests.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": chat_id, "text": "✅ נשלח טסט ל-VIP+"},
+                json={"chat_id": chat_id, "text": "VIP+ test sent"},
                 timeout=20,
             )
         elif data == "admin_send_daily_now":
@@ -1275,7 +1295,7 @@ class FortressScanner:
             self.send_daily_performance_report(day)
             requests.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": chat_id, "text": "📈 הדוח היומי נשלח עכשיו"},
+                json={"chat_id": chat_id, "text": "Daily report sent"},
                 timeout=20,
             )
 
@@ -1287,7 +1307,7 @@ class FortressScanner:
                     timeout=10,
                 )
             except Exception as exc:
-                print(f"[WARN] answerCallbackQuery failed: {exc}")
+                print(f"[TG] answerCallbackQuery failed: {exc}")
 
     def handle_admin_broadcast(self, text: str) -> None:
         targets = set(self._run_async_task(self.trade_manager.list_broadcast_targets()))
@@ -1306,11 +1326,11 @@ class FortressScanner:
                 if resp.ok:
                     sent += 1
             except Exception as exc:
-                print(f"[WARN] broadcast send to chat {chat} failed: {exc}")
+                print(f"[TG] broadcast send failed chat={chat} err={exc}")
                 continue
         requests.post(
             f"https://api.telegram.org/bot{self.token}/sendMessage",
-            json={"chat_id": str(self.admin_user_id), "text": f"📢 שידור נשלח ל־{sent} צ׳אטים."},
+            json={"chat_id": str(self.admin_user_id), "text": f"Broadcast delivered to {sent} chats."},
             timeout=20,
         )
 
@@ -1539,7 +1559,7 @@ class FortressScanner:
         self.min_score_threshold = max(5, min(self.min_score_threshold, 6))
         self.volume_spike_threshold = max(1.2, min(self.volume_spike_threshold, 1.6))
         print(
-            f"[LEARNING] loaded thresholds | min_score={self.min_score_threshold} | rel_vol={self.volume_spike_threshold:.2f}x"
+            f"[LEARN] thresholds loaded | min_score={self.min_score_threshold} | rel_vol={self.volume_spike_threshold:.2f}x"
         )
 
     def save_learning_state(self) -> None:
@@ -1571,7 +1591,7 @@ class FortressScanner:
         signal_id = self._run_async_task(
             self.trade_manager.save_signal(exchange_name=exchange_name, symbol=symbol, setup=setup)
         )
-        print(f"[DB] saved signal id={signal_id} {exchange_name} {symbol} {setup['side']}")
+        print(f"[SIGNAL] saved id={signal_id} {exchange_name} {symbol} {setup['side']}")
         return signal_id
 
     def update_pending_signal_statuses(self) -> None:
@@ -1602,7 +1622,7 @@ class FortressScanner:
                     self.trade_manager.sync_active_price(exchange_name, symbol, current_price)
                 )
             except Exception as exc:
-                print(f"[WARN] sync_active_price failed for {symbol}: {exc}")
+                print(f"[SIGNAL] sync_active_price failed symbol={symbol} err={exc}")
                 continue
 
             new_status = None
@@ -1647,7 +1667,7 @@ class FortressScanner:
                         last_price=float(current_price),
                     )
                 )
-                print(f"[DB] signal id={signal_id} reached target T{target_hit}")
+                print(f"[SIGNAL] id={signal_id} reached TP level T{target_hit}")
 
             if not new_status:
                 ts = row.get("timestamp")
@@ -1658,7 +1678,7 @@ class FortressScanner:
                 age_minutes = (datetime.now(UTC) - opened_at).total_seconds() / 60.0
                 if age_minutes >= float(self.trade_timeout_minutes):
                     new_status = "Timed Out"
-                    print(f"[DB] signal id={signal_id} timed out after {age_minutes:.0f}m")
+                    print(f"[SIGNAL] id={signal_id} timed out after {age_minutes:.0f}m")
                 else:
                     continue
 
@@ -1669,7 +1689,7 @@ class FortressScanner:
                     last_price=float(current_price),
                 )
             )
-            print(f"[DB] updated signal id={signal_id} -> {new_status}")
+            print(f"[SIGNAL] id={signal_id} status -> {new_status}")
 
     def adaptive_learning_step(self) -> None:
         """Self-tune thresholds based on the last 50 closed trades."""
@@ -1693,7 +1713,7 @@ class FortressScanner:
         if old_score != self.min_score_threshold or abs(old_vol - self.volume_spike_threshold) > 1e-9:
             self.save_learning_state()
             print(
-                f"[LEARNING] tuned thresholds | win_rate={win_rate:.2%} | min_score {old_score}->{self.min_score_threshold} | rel_vol {old_vol:.2f}->{self.volume_spike_threshold:.2f}"
+                f"[LEARN] tuned thresholds | win_rate={win_rate:.2%} | min_score {old_score}->{self.min_score_threshold} | rel_vol {old_vol:.2f}->{self.volume_spike_threshold:.2f}"
             )
         # Per-exchange / timeframe penalty model.
         exch_stats: Dict[str, List[str]] = {}
@@ -1734,7 +1754,7 @@ class FortressScanner:
             elif ratio <= 0.35:
                 self.rsi_weight = min(1.0, self.rsi_weight + 0.05)
         print(
-            f"[LEARNING] penalties ex={self.exchange_score_penalty} tf={self.timeframe_score_penalty} "
+            f"[LEARN] penalties ex={self.exchange_score_penalty} tf={self.timeframe_score_penalty} "
             f"rsi_weight={self.rsi_weight:.2f}"
         )
         # Pair scorecard: auto-blacklist weak pairs for 24h.
@@ -1751,9 +1771,9 @@ class FortressScanner:
             if sl_ratio >= 0.5:
                 try:
                     self._run_async_task(self.trade_manager.blacklist_pair(sym, ttl_seconds=24 * 60 * 60))
-                    print(f"[LEARNING] blacklisted {sym} for 24h (SL ratio={sl_ratio:.2f})")
+                    print(f"[LEARN] blacklisted {sym} for 24h (SL ratio={sl_ratio:.2f})")
                 except Exception as exc:
-                    print(f"[LEARNING] blacklist failed for {sym}: {exc}")
+                    print(f"[LEARN] blacklist failed for {sym}: {exc}")
 
     def status_watcher_loop(self) -> None:
         while True:
@@ -1761,7 +1781,7 @@ class FortressScanner:
                 self.update_pending_signal_statuses()
                 self.adaptive_learning_step()
             except Exception as exc:
-                print(f"[DB] status watcher error: {exc}")
+                print(f"[LOOP] status_watcher error: {exc}")
                 self._notify_if_infra_error(exc, "status_watcher_loop")
                 if not self._infra_component_from_error(str(exc)):
                     self.send_admin_notification(f"Status watcher error: {exc}", loud=True)
@@ -1807,12 +1827,12 @@ class FortressScanner:
         if not self.token:
             return
         if self._run_async_task(self.trade_manager.get_setting("DAILY_SUMMARY_ACTIVE", "true")).strip().lower() != "true":
-            print("[REPORT] skipped: DAILY_SUMMARY_ACTIVE is false")
+            print("[REPORT] skip | DAILY_SUMMARY_ACTIVE=false")
             return
 
         rows = self.fetch_signals_for_day(day_utc)
         if not rows:
-            print(f"[REPORT] no signals found for {day_utc}")
+            print(f"[REPORT] no rows for day={day_utc}")
             return
 
         entries: List[str] = []
@@ -1872,7 +1892,7 @@ class FortressScanner:
             target_chats.append(self.vip_plus_chat_id)
 
         if not target_chats:
-            print("[REPORT] skipped: no target chat ids configured")
+            print("[REPORT] skip | no TELEGRAM_CHAT_ID / broadcast targets configured")
             return
 
         success_count = 0
@@ -1948,7 +1968,7 @@ class FortressScanner:
             if len(symbols) < self.max_symbols and fallback_symbols:
                 needed = self.max_symbols - len(symbols)
                 symbols.extend(fallback_symbols[:needed])
-            print(f"[{exchange_name}] tracking {len(symbols)} high-volume USDT pairs")
+            print(f"[SCAN] {exchange_name} | universe size={len(symbols)} USDT pairs (volume-ranked)")
             return symbols
         except Exception as exc:
             # If auth keys are invalid or restricted, retry once with public market-data client.
@@ -1988,11 +2008,14 @@ class FortressScanner:
                         if len(symbols) < self.max_symbols and fallback_symbols:
                             needed = self.max_symbols - len(symbols)
                             symbols.extend(fallback_symbols[:needed])
-                        print(f"[{exchange_name}] auth fallback -> public feed, tracking {len(symbols)} high-volume USDT pairs")
+                        print(
+                            f"[SCAN] {exchange_name} | auth failed, using public market data | "
+                            f"universe size={len(symbols)} USDT pairs"
+                        )
                         return symbols
                 except Exception as fallback_exc:
-                    print(f"[{exchange_name}] public fallback failed: {fallback_exc}")
-            print(f"[{exchange_name}] failed to fetch top symbols: {exc}")
+                    print(f"[SCAN] {exchange_name} | public market fallback failed: {fallback_exc}")
+            print(f"[SCAN] {exchange_name} | failed to build symbol universe: {exc}")
             self.send_admin_notification(f"{exchange_name} top symbol fetch error: {exc}", loud=True)
             return []
 
@@ -2313,7 +2336,7 @@ class FortressScanner:
                     support_wall_ok = True
                 ratios.append(ratio)
             except Exception as exc:
-                print(f"[WARN] order-book wall probe failed: {exc}")
+                print(f"[PROBE] order-book wall probe failed: {exc}")
                 continue
         ok = len(confirmed) >= 1 and (max(ratios) >= 2.0 if ratios else False)
         text = f"2:1 + wall ({'/'.join(confirmed)})" if ok else "Imbalance/Wall not confirmed"
@@ -2365,7 +2388,7 @@ class FortressScanner:
                     elif side_trade == "sell":
                         bears_usd += usd_notional
             except Exception as exc:
-                print(f"[WARN] whale-flow taker probe failed: {exc}")
+                print(f"[PROBE] whale-flow taker probe failed: {exc}")
                 continue
 
         large_trades_ok = large_trade_count >= 3
@@ -2387,22 +2410,22 @@ class FortressScanner:
     def run_layer7_live_test(self, top_n: int = 5, exchange_name: str = "Binance") -> None:
         ex = self.exchanges.get(exchange_name)
         if not ex:
-            print(f"[L7-TEST] exchange unavailable: {exchange_name}")
+            print(f"[DEV-L7] exchange unavailable: {exchange_name}")
             return
         symbols = self.top_usdt_symbols(exchange_name, ex)[:top_n]
-        print(f"[L7-TEST] running on {exchange_name} top {len(symbols)} symbols")
+        print(f"[DEV-L7] running on {exchange_name} top {len(symbols)} symbols")
         for symbol in symbols:
             try:
                 rows = ex.fetch_ohlcv(symbol, timeframe="5m", limit=80)
                 if not rows:
-                    print(f"[L7-TEST] {symbol} FAIL | no ohlcv")
+                    print(f"[DEV-L7] {symbol} FAIL | no ohlcv")
                     continue
                 d5 = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
                 d5["ts"] = pd.to_datetime(d5["ts"], unit="ms", utc=True)
                 current_price = float(d5.iloc[-1]["close"])
                 atr = float(self.add_indicators(d5).iloc[-1]["atr"] or 0.0)
                 if atr <= 0:
-                    print(f"[L7-TEST] {symbol} FAIL | ATR unavailable")
+                    print(f"[DEV-L7] {symbol} FAIL | ATR unavailable")
                     continue
                 entry = current_price
                 side = "LONG"
@@ -2411,10 +2434,10 @@ class FortressScanner:
                 layer7 = self._run_async_task(self._layer7_whale_flow(symbol, side, layer6))
                 status = "PASS" if layer7.get("ok") else "FAIL"
                 print(
-                    f"[L7-TEST] {symbol} {status} | L6={layer6.get('text')} | L7={layer7.get('text')}"
+                    f"[DEV-L7] {symbol} {status} | L6={layer6.get('text')} | L7={layer7.get('text')}"
                 )
             except Exception as exc:
-                print(f"[L7-TEST] {symbol} FAIL | error={exc}")
+                print(f"[DEV-L7] {symbol} FAIL | error={exc}")
 
     async def _layer8_social_session(self, symbol: str, ts_utc: pd.Timestamp) -> dict:
         session_ok = self._is_power_session(ts_utc)
@@ -2605,21 +2628,21 @@ class FortressScanner:
     def run_vip_plus_layer_test(self, symbols: List[str], exchange_name: str = "Binance") -> None:
         ex = self.exchanges.get(exchange_name)
         if not ex:
-            print(f"[VIP+-TEST] exchange unavailable: {exchange_name}")
+            print(f"[DEV-VIP+] exchange unavailable: {exchange_name}")
             return
         for symbol in symbols:
-            print(f"\n[VIP+-TEST] {symbol} ({exchange_name})")
+            print(f"\n[DEV-VIP+] {symbol} ({exchange_name})")
             try:
                 dfs = self.fetch_multi_timeframes(ex, symbol)
                 if not dfs:
-                    print("[VIP+-TEST] FAIL | data fetch failed")
+                    print("[DEV-VIP+] FAIL | data fetch failed")
                     continue
                 d4h = self.add_indicators(dfs["4h"])
                 d1h = self.add_indicators(dfs["1h"])
                 d15 = self.add_indicators(dfs["15m"])
                 d5 = self.add_indicators(dfs["5m"])
                 if d4h.iloc[-1].isna().any() or d1h.iloc[-1].isna().any() or d15.iloc[-1].isna().any() or d5.iloc[-1].isna().any():
-                    print("[VIP+-TEST] FAIL | indicator NaN")
+                    print("[DEV-VIP+] FAIL | indicator NaN")
                     continue
                 price = float(d5.iloc[-1]["close"])
                 trend_up = float(d4h.iloc[-1]["close"]) > float(d4h.iloc[-1]["ema200"])
@@ -2642,7 +2665,7 @@ class FortressScanner:
                 volume_spike = avg_volume > 0 and current_volume > (avg_volume * 1.5)
                 atr = float(d5.iloc[-1]["atr"])
                 if atr <= 0:
-                    print("[VIP+-TEST] FAIL | ATR unavailable")
+                    print("[DEV-VIP+] FAIL | ATR unavailable")
                     continue
                 entry = price
                 sl = entry - (1.5 * atr) if side == "LONG" else entry + (1.5 * atr)
@@ -2668,14 +2691,14 @@ class FortressScanner:
                 )
                 lines = layered.get("vip_plus_layer_lines", [])
                 for ln in lines:
-                    print(f"  {ln}")
+                    print(f"[DEV-VIP+]   {ln}")
                 if layered.get("vip_plus_ok"):
-                    print("  => VIP+ PASS (all layers 1-8)")
+                    print("[DEV-VIP+] result=PASS (layers 1-8)")
                 else:
                     fail_line = next((ln for ln in lines if "FAIL" in ln), "Unknown fail layer")
-                    print(f"  => VIP+ REJECTED at: {fail_line}")
+                    print(f"[DEV-VIP+] result=REJECT first_fail={fail_line}")
             except Exception as exc:
-                print(f"[VIP+-TEST] FAIL | error={repr(exc)}")
+                print(f"[DEV-VIP+] FAIL | error={repr(exc)}")
 
     @staticmethod
     def analyze_order_book_depth(
@@ -2855,7 +2878,7 @@ class FortressScanner:
                         "text": "Bullish" if oi_bullish else "Flat/Weak",
                     }
                 except Exception as exc:
-                    print(f"[WARN] derivatives layer probe failed: {exc}")
+                    print(f"[PROBE] derivatives layer probe failed: {exc}")
                     continue
         return {"ok": False, "oi_bullish": False, "funding_rate_pct": 0.0, "text": "Unavailable"}
 
@@ -3186,7 +3209,7 @@ class FortressScanner:
             else:
                 return None
         if self.vip_strict_mode and (not self.aggressive_signal_mode) and not layered.get("vip_ok", False):
-            print(f"[LAYER-GATE] {symbol} rejected VIP stack | " + " | ".join(layered.get("vip_layer_lines", [])))
+            print(f"[GATE] {symbol} rejected VIP stack | " + " | ".join(layered.get("vip_layer_lines", [])))
             return None
 
         # Keep prior synchronicity diagnostics as additional data point.
@@ -3335,7 +3358,7 @@ class FortressScanner:
                     up_count += 1
                 checked += 1
             except Exception as exc:
-                print(f"[WARN] sector-strength EMA probe failed: {exc}")
+                print(f"[PROBE] sector-strength EMA probe failed: {exc}")
                 continue
         if checked == 0:
             return False, 0.0
@@ -3584,11 +3607,11 @@ class FortressScanner:
             )
             if not resp.ok:
                 print(
-                    f"[TELEGRAM] target update failed ({resp.status_code}) | "
-                    f"signal={row.get('id')} target=T{target_number} | {resp.text}"
+                    f"[TG] target_hit reply failed status={resp.status_code} | "
+                    f"signal_id={row.get('id')} target=T{target_number} | {resp.text}"
                 )
         except Exception as exc:
-            print(f"[TELEGRAM] target update error | signal={row.get('id')} target=T{target_number} | {exc}")
+            print(f"[TG] target_hit reply error signal_id={row.get('id')} target=T{target_number} | {exc}")
 
     def build_chart_image_bytes(self, exchange_name: str, symbol: str, setup: Optional[dict] = None) -> Optional[bytes]:
         """Build a high-quality 1H candlestick chart from live exchange OHLCV."""
@@ -3728,13 +3751,14 @@ class FortressScanner:
 
     def send_telegram(self, exchange_name: str, symbol: str, setup: dict) -> None:
         if not self.vip_token:
-            print(f"[TELEGRAM] SKIPPED (missing credentials) | {exchange_name} {symbol}")
+            print(f"[TG] skip send | no bot token (set TELEGRAM_BOT_TOKEN / VIP_TELEGRAM_BOT_TOKEN) | {exchange_name} {symbol}")
             return
 
         key = f"{exchange_name}:{symbol}:{setup['side']}"
         now = time.time()
         if key in self.last_alert_at and (now - self.last_alert_at[key]) < self.alert_cooldown_seconds:
-            print(f"[ANTI-SPAM] skipped {key} (cooldown 60m)")
+            cd = self.alert_cooldown_seconds
+            print(f"[TG] skip duplicate key={key} per_key_cooldown={cd}s (~{cd / 60.0:.1f} min)")
             return
         ex_for_slippage = self.exchanges.get(exchange_name)
         if ex_for_slippage is not None:
@@ -3744,8 +3768,8 @@ class FortressScanner:
                 slippage_pct = abs((live_price - entry_px) / entry_px) * 100.0
                 if slippage_pct > self.slippage_expire_pct:
                     print(
-                        f"[EXECUTION] expired {exchange_name} {symbol}: "
-                        f"slippage {slippage_pct:.2f}% > {self.slippage_expire_pct:.2f}%"
+                        f"[EXEC] skip expired {exchange_name} {symbol} | "
+                        f"slippage {slippage_pct:.2f}% > max {self.slippage_expire_pct:.2f}%"
                     )
                     if setup.get("signal_id") is not None:
                         try:
@@ -3773,15 +3797,15 @@ class FortressScanner:
         with self.signal_pacing_lock:
             if self.max_signals_per_cycle > 0 and self.cycle_signal_sent_count >= self.max_signals_per_cycle:
                 print(
-                    f"[PACING] skipped {exchange_name} {symbol}: cycle cap reached "
-                    f"({self.cycle_signal_sent_count}/{self.max_signals_per_cycle})"
+                    f"[PACE] skip {exchange_name} {symbol} | cycle_cap "
+                    f"{self.cycle_signal_sent_count}/{self.max_signals_per_cycle}"
                 )
                 return
             since_last = now - self.last_global_signal_sent_at
             if since_last < adaptive_gap_seconds:
                 print(
-                    f"[PACING] skipped {exchange_name} {symbol}: waiting gap "
-                    f"{since_last:.1f}/{adaptive_gap_seconds}s"
+                    f"[PACE] skip {exchange_name} {symbol} | min_gap "
+                    f"{since_last:.1f}s / need {adaptive_gap_seconds}s"
                 )
                 return
 
@@ -3917,7 +3941,7 @@ class FortressScanner:
                         timeout=20,
                     )
                 if not resp.ok:
-                    print(f"[TELEGRAM] send failed ({resp.status_code}) | chat={chat_id} | {exchange_name} {symbol} | {resp.text}")
+                    print(f"[TG] send failed status={resp.status_code} chat={chat_id} | {exchange_name} {symbol} | {resp.text}")
                     return None
                 try:
                     body = resp.json()
@@ -4009,7 +4033,7 @@ class FortressScanner:
                     token=self.vip_plus_token,
                 )
                 if msg_id:
-                    self.vip_signal_count += 1
+                    self.vip_plus_messages_sent += 1
                     self.daily_flow["vip_plus_sent"] = vip_plus_sent_today + 1
                     sent_any = True
                     if signal_id_opt is not None:
@@ -4031,7 +4055,7 @@ class FortressScanner:
                         token=self.vip_plus_token,
                     )
                     if fallback_msg_id:
-                        self.vip_signal_count += 1
+                        self.vip_plus_messages_sent += 1
                         self.daily_flow["vip_plus_sent"] = vip_plus_sent_today + 1
                         sent_any = True
                         if signal_id_opt is not None:
@@ -4043,12 +4067,12 @@ class FortressScanner:
                                 )
                             )
                         setup["original_message_saved"] = True
-                        print(f"[TELEGRAM] VIP+ fallback text sent | {exchange_name} {symbol}")
+                        print(f"[TG] VIP+ sent as plain text fallback | {exchange_name} {symbol}")
             elif self.vip_plus_chat_id:
                 print(
-                    f"[TELEGRAM] VIP+ skipped by gate | {exchange_name} {symbol} | "
+                    f"[TG] VIP+ not sent (gates) | {exchange_name} {symbol} | "
                     f"allow={allow_vip_plus} vip_plus_ok={setup.get('vip_plus_ok')} "
-                    f"vip_plus_soft_ok={setup.get('vip_plus_soft_ok')} sent_today={vip_plus_sent_today}"
+                    f"vip_plus_soft_ok={setup.get('vip_plus_soft_ok')} vip_plus_sent_today={vip_plus_sent_today}"
                 )
 
             # Regular VIP now uses chart-first layout as well (photo + caption),
@@ -4062,7 +4086,7 @@ class FortressScanner:
                     token=self.vip_token,
                 )
                 if msg_id:
-                    self.chat_signal_count += 1
+                    self.vip_channel_messages_sent += 1
                     self.daily_flow["chat_sent"] = chat_sent_today + 1
                     sent_any = True
                     if not setup.get("original_message_saved"):
@@ -4098,16 +4122,17 @@ class FortressScanner:
                         )
                     )
                 except Exception as exc:
-                    print(f"[PACING] cooldown/throttle register failed: {exc}")
+                    print(f"[THROTTLE] persist send metadata failed: {exc}")
                 print(
-                    f"[TELEGRAM] SENT routed signal | {exchange_name} {symbol} | score={setup['score']}/10 | vip={self.vip_signal_count} chat={self.chat_signal_count}"
+                    f"[TG] sent | {exchange_name} {symbol} | score={setup['score']}/10 | "
+                    f"vip_plus_total={self.vip_plus_messages_sent} vip_channel_total={self.vip_channel_messages_sent}"
                 )
             else:
                 print(
-                    f"[TELEGRAM] routed signal skipped (no successful sends) | {exchange_name} {symbol}"
+                    f"[TG] not sent (no channel accepted this setup) | {exchange_name} {symbol}"
                 )
         except Exception as exc:
-            print(f"[TELEGRAM] ERROR while sending | {exchange_name} {symbol} | {exc}")
+            print(f"[TG] send exception | {exchange_name} {symbol} | {exc}")
             self.send_admin_notification(
                 f"Telegram send error | {exchange_name} {symbol} | {exc}",
                 loud=True,
@@ -4142,7 +4167,7 @@ class FortressScanner:
                 )
                 return
         except Exception as exc:
-            print(f"[THROTTLE] redis gating unavailable, continuing: {exc}")
+            print(f"[THROTTLE] Redis rate window unavailable, continuing without Redis gate: {exc}")
         data = self.fetch_multi_timeframes(ex, symbol)
         if not data:
             return
@@ -4222,7 +4247,7 @@ class FortressScanner:
                 return
 
         if self.has_recent_signal(symbol, minutes=30):
-            print(f"[DB-MEMORY] skipped {symbol} (signal exists in last 30m)")
+            print(f"[SIGNAL] skip | duplicate in last 30m symbol={symbol}")
             return
         today = datetime.now(UTC).strftime("%Y-%m-%d")
         total_today, lowest_pending = self._run_async_task(
@@ -4359,7 +4384,7 @@ class FortressScanner:
                     worker_failures += 1
                     if first_error is None:
                         first_error = str(exc)
-                    print(f"[{exchange_name}] symbol worker failed: {exc}")
+                    print(f"[SCAN] {exchange_name} | symbol task error: {exc}")
         if worker_failures > 0:
             self.notify_worker_failure_once(
                 exchange_name=exchange_name,
@@ -4399,7 +4424,7 @@ class FortressScanner:
             worker_failures += 1
             if first_error is None:
                 first_error = str(r)
-            print(f"[{exchange_name}] symbol worker failed: {r}")
+            print(f"[SCAN] {exchange_name} | symbol task error: {r}")
         if worker_failures > 0:
             self.notify_worker_failure_once(
                 exchange_name=exchange_name,
@@ -4410,31 +4435,31 @@ class FortressScanner:
 
     def run_cycle(self) -> None:
         if not self._run_async_task(self.trade_manager.is_bot_active()):
-            print("[ENGINE] BOT_ACTIVE=false, skipping cycle")
+            print("[SCAN] cycle skipped | BOT_ACTIVE=false")
             return
         with self.signal_pacing_lock:
             self.cycle_signal_sent_count = 0
-        print("\n=== Fortress Scanner v1.2 cycle started ===")
+        print("\n[SCAN] === cycle start (sync path) ===")
         with ThreadPoolExecutor(max_workers=2) as pool:
             jobs = [pool.submit(self.scan_exchange, name, ex) for name, ex in self.exchanges.items()]
             for job in as_completed(jobs):
                 try:
                     job.result()
                 except Exception as exc:
-                    print(f"[ENGINE] exchange worker failed: {exc}")
+                    print(f"[SCAN] exchange batch thread failed: {exc}")
                     self.send_admin_notification(
-                        f"Engine exchange worker failed: {exc}",
+                        f"Scanner exchange batch failed: {exc}",
                         loud=True,
                     )
-        print("=== Fortress Scanner cycle completed ===")
+        print("[SCAN] === cycle complete (sync path) ===")
 
     async def run_cycle_async(self) -> None:
         if not await self.trade_manager.is_bot_active():
-            print("[ENGINE] BOT_ACTIVE=false, skipping cycle")
+            print("[SCAN] cycle skipped | BOT_ACTIVE=false")
             return
         with self.signal_pacing_lock:
             self.cycle_signal_sent_count = 0
-        print("\n=== Fortress Scanner v1.2 cycle started ===")
+        print("\n[SCAN] === cycle start ===")
         sem = asyncio.Semaphore(max(4, self.scan_semaphore_size))
         jobs = [
             asyncio.create_task(self.scan_exchange_async(name, ex, sem))
@@ -4443,23 +4468,23 @@ class FortressScanner:
         results = await asyncio.gather(*jobs, return_exceptions=True)
         for res in results:
             if isinstance(res, Exception):
-                print(f"[ENGINE] exchange worker failed: {res}")
+                print(f"[SCAN] exchange async batch failed: {res}")
                 self.send_admin_notification(
-                    f"Engine exchange worker failed: {res}",
+                    f"Scanner exchange batch failed: {res}",
                     loud=True,
                 )
-        print("=== Fortress Scanner cycle completed ===")
+        print("[SCAN] === cycle complete ===")
 
     def run_forever(self) -> None:
         while True:
             try:
                 self._run_async_task(self.run_cycle_async())
             except Exception as exc:
-                print(f"[FATAL] cycle error: {exc}")
+                print(f"[FATAL] scan loop error: {exc}")
                 self._notify_if_infra_error(exc, "run_forever")
                 if not self._infra_component_from_error(str(exc)):
                     self.send_admin_notification(f"FATAL cycle error: {exc}", loud=True)
-            print(f"Sleeping {self.scan_interval_seconds}s...\n")
+            print(f"[SCAN] sleep {self.scan_interval_seconds}s until next cycle\n")
             time.sleep(self.scan_interval_seconds)
 
 

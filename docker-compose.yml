@@ -1,8 +1,7 @@
-# FalconEye — הרמת הבוט + PostgreSQL + Redis ברשת אחת.
-# ב-Docker השירותים נגישים בשמות הקונטיינרים, לא localhost.
-# משתני .env שלך (מפתחות טלגרם וכו') נטענים מ-env_file; החיבורים למסד נדרסים כאן.
-
-name: falconeye
+# FalconEye — bot + PostgreSQL + Redis on one Docker network.
+# Inside Docker, use service/container hostnames (not localhost).
+# Secrets load from .env via env_file; DB/Redis hosts are overridden below.
+# No top-level `name:` key — compatible with docker-compose v1 on older hosts.
 
 services:
   app:
