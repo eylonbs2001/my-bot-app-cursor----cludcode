@@ -1027,7 +1027,8 @@ class FortressScanner:
         if str(target_chat_id).startswith("-"):
             print(f"[ADMIN] blocked alert to non-private chat id: {target_chat_id}")
             return
-        body = f"🚨 {text}" if loud else f"✅ {text}"
+        prefix = "ALERT:" if loud else "INFO:"
+        body = f"{prefix} {text}".strip()
         payload = {
             "chat_id": target_chat_id,
             "text": body,
@@ -1052,19 +1053,37 @@ class FortressScanner:
             return "redis"
         return None
 
-    def notify_infra_issue_once(self, component: str, exc: Exception, context: str) -> None:
+    def _infra_alert_cooldown_minutes(self) -> int:
+        """Whole minutes matching infra_alert_cooldown_sec (minimum 1 for messaging)."""
+        return max(1, int(self.infra_alert_cooldown_sec // 60))
+
+    def _claim_infra_alert_slot(self, dedupe_key: str) -> bool:
+        """
+        Return True if an infra alert may be sent now; record send time for anti-spam.
+        """
         now = time.time()
-        last_sent = self._infra_alert_last_sent.get(component, 0.0)
-        if (now - last_sent) < self.infra_alert_cooldown_sec:
+        if (now - self._infra_alert_last_sent.get(dedupe_key, 0.0)) < self.infra_alert_cooldown_sec:
+            return False
+        self._infra_alert_last_sent[dedupe_key] = now
+        return True
+
+    @staticmethod
+    def _clip_alert_detail(text: str, limit: int = 500) -> str:
+        raw = (text or "").strip()
+        if not raw:
+            return "unknown"
+        return raw[:limit]
+
+    def notify_infra_issue_once(self, component: str, exc: Exception, context: str) -> None:
+        if not self._claim_infra_alert_slot(component):
             return
-        self._infra_alert_last_sent[component] = now
-        cooldown_min = max(1, self.infra_alert_cooldown_sec // 60)
+        cooldown_min = self._infra_alert_cooldown_minutes()
         error_text = str(exc).strip() or exc.__class__.__name__
         message = (
             "Bot infrastructure issue (aggregated alert)\n"
             f"Component: {'PostgreSQL' if component == 'database' else 'Redis'}\n"
             f"Context: {context}\n"
-            f"Error: {error_text[:500]}\n"
+            f"Error: {self._clip_alert_detail(error_text)}\n"
             "Auto-recovery: the bot will keep retrying on the next cycles.\n"
             f"Anti-spam: next alert in ~{cooldown_min} minutes."
         )
@@ -1075,20 +1094,18 @@ class FortressScanner:
         if component:
             self.notify_infra_issue_once(component=component, exc=exc, context=context)
 
-    def notify_worker_failure_once(self, exchange_name: str, failed: int, total: int, first_error: str) -> None:
-        # Dedicated anti-spam channel for exchange worker bursts.
-        component_key = f"workers_{exchange_name.lower()}"
-        now = time.time()
-        last_sent = self._infra_alert_last_sent.get(component_key, 0.0)
-        if (now - last_sent) < self.infra_alert_cooldown_sec:
+    def notify_worker_failure_once(
+        self, exchange_name: str, failed: int, total: int, first_error: str
+    ) -> None:
+        dedupe_key = f"workers_{exchange_name.lower()}"
+        if not self._claim_infra_alert_slot(dedupe_key):
             return
-        self._infra_alert_last_sent[component_key] = now
-        cooldown_min = max(1, self.infra_alert_cooldown_sec // 60)
+        cooldown_min = self._infra_alert_cooldown_minutes()
         msg = (
             "Scanner engine issue (aggregated)\n"
             f"Exchange: {exchange_name}\n"
             f"Failed workers: {failed}/{total}\n"
-            f"First error: {(first_error or 'unknown')[:500]}\n"
+            f"First error: {self._clip_alert_detail(first_error)}\n"
             "Note: this alert is sent only to the admin private chat.\n"
             f"Anti-spam: next message in ~{cooldown_min} minutes."
         )
