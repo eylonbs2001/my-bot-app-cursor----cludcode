@@ -11,7 +11,7 @@ import asyncio
 import warnings
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, UTC
+from datetime import UTC, date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -269,8 +269,6 @@ class TradeManager:
     async def recover_active_trades(self) -> List[dict]:
         if self.pool is None:
             raise RuntimeError("Postgres pool is not initialized; call startup() first")
-        if self.redis is None:
-            raise RuntimeError("Redis connection is not initialized; call startup() first")
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
@@ -281,11 +279,12 @@ class TradeManager:
                 """
             )
         active = [dict(r) for r in rows]
-        for trade in active:
-            await self.redis.hset(
-                f"active_trade:{trade['id']}",
-                mapping={k: str(v) for k, v in trade.items()},
-            )
+        if self.redis is not None:
+            for trade in active:
+                await self.redis.hset(
+                    f"active_trade:{trade['id']}",
+                    mapping={k: str(v) for k, v in trade.items()},
+                )
         return active
 
     async def has_recent_signal(self, symbol: str, minutes: int = 30) -> bool:
@@ -308,8 +307,6 @@ class TradeManager:
     async def save_signal(self, exchange_name: str, symbol: str, setup: dict) -> int:
         if self.pool is None:
             raise RuntimeError("Postgres pool is not initialized; call startup() first")
-        if self.redis is None:
-            raise RuntimeError("Redis connection is not initialized; call startup() first")
         async with self.pool.acquire() as conn:
             signal_id = await conn.fetchval(
                 """
@@ -334,23 +331,24 @@ class TradeManager:
                 float(setup.get("adx", 20.0)),
                 float(setup.get("rel_volume", 1.0)),
             )
-        await self.redis.hset(
-            f"active_trade:{signal_id}",
-            mapping={
-                "id": str(signal_id),
-                "exchange": exchange_name,
-                "symbol": symbol,
-                "side": setup["side"],
-                "entry_price": str(float(setup["entry"])),
-                "stop_loss": str(float(setup["sl"])),
-                "tp1": str(float(setup["tp1"])),
-                "tp2": str(float(setup["tp2"])),
-                "tp3": str(float(setup["tp3"])),
-                "score": str(int(setup["score"])),
-                "status": "Pending",
-                "last_target_hit": "0",
-            },
-        )
+        if self.redis is not None:
+            await self.redis.hset(
+                f"active_trade:{signal_id}",
+                mapping={
+                    "id": str(signal_id),
+                    "exchange": exchange_name,
+                    "symbol": symbol,
+                    "side": setup["side"],
+                    "entry_price": str(float(setup["entry"])),
+                    "stop_loss": str(float(setup["sl"])),
+                    "tp1": str(float(setup["tp1"])),
+                    "tp2": str(float(setup["tp2"])),
+                    "tp3": str(float(setup["tp3"])),
+                    "score": str(int(setup["score"])),
+                    "status": "Pending",
+                    "last_target_hit": "0",
+                },
+            )
         return int(signal_id)
 
     async def fetch_pending_signals(self) -> List[dict]:
@@ -384,8 +382,6 @@ class TradeManager:
     async def update_signal_status(self, signal_id: int, status: str, last_price: float) -> None:
         if self.pool is None:
             raise RuntimeError("Postgres pool is not initialized; call startup() first")
-        if self.redis is None:
-            raise RuntimeError("Redis connection is not initialized; call startup() first")
         async with self.pool.acquire() as conn:
             await conn.execute(
                 "UPDATE signals SET status = $1, last_price = $2 WHERE id = $3",
@@ -434,7 +430,8 @@ class TradeManager:
                         float(row["adx_snapshot"] or 20.0),
                         float(row["rel_volume_snapshot"] or 1.0),
                     )
-        await self.redis.delete(f"active_trade:{signal_id}")
+        if self.redis is not None:
+            await self.redis.delete(f"active_trade:{signal_id}")
 
     async def fetch_recent_trade_journal(self, limit: int = 50) -> List[dict]:
         if self.pool is None:
@@ -480,8 +477,6 @@ class TradeManager:
     async def update_target_progress(self, signal_id: int, target_hit: int, last_price: float) -> None:
         if self.pool is None:
             raise RuntimeError("Postgres pool is not initialized; call startup() first")
-        if self.redis is None:
-            raise RuntimeError("Redis connection is not initialized; call startup() first")
         progress_status = "Pending"
         if int(target_hit) == 1:
             progress_status = "T1_DONE"
@@ -503,14 +498,15 @@ class TradeManager:
                 progress_status,
                 int(signal_id),
             )
-        await self.redis.hset(
-            f"active_trade:{signal_id}",
-            mapping={
-                "last_target_hit": str(int(target_hit)),
-                "last_price": str(float(last_price)),
-                "status": progress_status,
-            },
-        )
+        if self.redis is not None:
+            await self.redis.hset(
+                f"active_trade:{signal_id}",
+                mapping={
+                    "last_target_hit": str(int(target_hit)),
+                    "last_price": str(float(last_price)),
+                    "status": progress_status,
+                },
+            )
 
     async def attach_original_message(
         self,
@@ -520,8 +516,6 @@ class TradeManager:
     ) -> None:
         if self.pool is None:
             raise RuntimeError("Postgres pool is not initialized; call startup() first")
-        if self.redis is None:
-            raise RuntimeError("Redis connection is not initialized; call startup() first")
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
@@ -535,23 +529,24 @@ class TradeManager:
                 int(message_id),
                 int(signal_id),
             )
-        await self.redis.hset(
-            f"active_trade:{signal_id}",
-            mapping={
-                "original_chat_id": str(chat_id),
-                "chat_id": str(chat_id),
-                "original_message_id": str(int(message_id)),
-            },
-        )
+        if self.redis is not None:
+            await self.redis.hset(
+                f"active_trade:{signal_id}",
+                mapping={
+                    "original_chat_id": str(chat_id),
+                    "chat_id": str(chat_id),
+                    "original_message_id": str(int(message_id)),
+                },
+            )
 
     async def sync_active_price(self, exchange_name: str, symbol: str, price: float) -> None:
         if self.redis is None:
-            raise RuntimeError("Redis connection is not initialized; call startup() first")
+            return
         await self.redis.set(f"price:{exchange_name}:{symbol}", f"{float(price):.10f}", ex=900)
 
     async def cache_layer_diagnostics(self, signal_id: int, setup: dict) -> None:
         if self.redis is None:
-            raise RuntimeError("Redis connection is not initialized; call startup() first")
+            return
         payload = {
             "vip_ok": str(bool(setup.get("vip_ok", False))),
             "vip_plus_ok": str(bool(setup.get("vip_plus_ok", False))),
@@ -563,20 +558,20 @@ class TradeManager:
 
     async def is_symbol_on_cooldown(self, exchange_name: str, symbol: str) -> bool:
         if self.redis is None:
-            raise RuntimeError("Redis connection is not initialized; call startup() first")
+            return False
         key = f"signal_cd:{exchange_name}:{symbol}"
         val = await self.redis.get(key)
         return val is not None
 
     async def mark_symbol_cooldown(self, exchange_name: str, symbol: str, cooldown_seconds: int) -> None:
         if self.redis is None:
-            raise RuntimeError("Redis connection is not initialized; call startup() first")
+            return
         key = f"signal_cd:{exchange_name}:{symbol}"
         await self.redis.set(key, "1", ex=max(60, int(cooldown_seconds)))
 
     async def count_signals_last_window(self, window_seconds: int) -> int:
         if self.redis is None:
-            raise RuntimeError("Redis connection is not initialized; call startup() first")
+            return 0
         key = "signal_throttle_window"
         now = int(time.time())
         min_score = now - int(window_seconds)
@@ -587,7 +582,7 @@ class TradeManager:
 
     async def register_signal_send(self, exchange_name: str, symbol: str, window_seconds: int) -> None:
         if self.redis is None:
-            raise RuntimeError("Redis connection is not initialized; call startup() first")
+            return
         key = "signal_throttle_window"
         now = int(time.time())
         member = f"{now}:{exchange_name}:{symbol}:{now % 1000000}"
@@ -597,12 +592,12 @@ class TradeManager:
 
     async def is_pair_blacklisted(self, symbol: str) -> bool:
         if self.redis is None:
-            raise RuntimeError("Redis connection is not initialized; call startup() first")
+            return False
         return bool(await self.redis.get(f"pair_blacklist:{symbol}"))
 
     async def blacklist_pair(self, symbol: str, ttl_seconds: int = 86400) -> None:
         if self.redis is None:
-            raise RuntimeError("Redis connection is not initialized; call startup() first")
+            return
         await self.redis.set(f"pair_blacklist:{symbol}", "1", ex=max(300, int(ttl_seconds)))
 
     async def fetch_signals_for_day(self, day_utc) -> List[tuple]:
@@ -610,13 +605,12 @@ class TradeManager:
             raise RuntimeError("Postgres pool is not initialized; call startup() first")
         # Normalize input: asyncpg's $1::date adapter requires a real datetime.date,
         # not a 'YYYY-MM-DD' string. Accept either and coerce.
-        from datetime import date as _date, datetime as _dt
-        if isinstance(day_utc, _dt):
+        if isinstance(day_utc, datetime):
             day_value = day_utc.date()
-        elif isinstance(day_utc, _date):
+        elif isinstance(day_utc, date):
             day_value = day_utc
         elif isinstance(day_utc, str):
-            day_value = _dt.strptime(day_utc, "%Y-%m-%d").date()
+            day_value = datetime.strptime(day_utc, "%Y-%m-%d").date()
         else:
             raise TypeError(f"fetch_signals_for_day: unsupported type {type(day_utc).__name__}")
         async with self.pool.acquire() as conn:
@@ -1204,6 +1198,20 @@ class FortressScanner:
         except Exception as exc:
             print(f"[ADMIN] dashboard send error: {exc}")
 
+    def _admin_send_text(self, chat_id: str, text: str, *, timeout: float = 20) -> None:
+        """Resilient sendMessage for admin replies. Logs and swallows transient failures
+        so a single Telegram blip never aborts a callback handler mid-flow."""
+        if not self.token:
+            return
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{self.token}/sendMessage",
+                json={"chat_id": str(chat_id), "text": text},
+                timeout=timeout,
+            )
+        except Exception as exc:
+            print(f"[TG] admin reply failed chat={chat_id}: {exc}")
+
     def handle_admin_callback(self, query: dict) -> None:
         callback_id = query.get("id")
         data = str(query.get("data") or "")
@@ -1214,107 +1222,50 @@ class FortressScanner:
             return
 
         chat_id = str((msg.get("chat") or {}).get("id") or self.admin_user_id)
-        response_text = "Done"
         if data == "admin_stats":
             total_active, win_rate = self._run_async_task(self.trade_manager.get_admin_stats())
-            response_text = f"Stats\nActive trades: {total_active}\nWin rate: {win_rate:.2f}%"
-            requests.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": chat_id, "text": response_text},
-                timeout=20,
-            )
+            self._admin_send_text(chat_id, f"Stats\nActive trades: {total_active}\nWin rate: {win_rate:.2f}%")
         elif data == "admin_users":
             users_count = self._run_async_task(self.trade_manager.count_users())
-            response_text = f"Unique users: {users_count}"
-            requests.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": chat_id, "text": response_text},
-                timeout=20,
-            )
+            self._admin_send_text(chat_id, f"Unique users: {users_count}")
         elif data == "admin_stop":
             active = self._run_async_task(self.trade_manager.is_bot_active())
             new_state = not active
             self._run_async_task(self.trade_manager.set_bot_active(new_state))
-            response_text = f"Bot: {'ENABLED' if new_state else 'DISABLED'}"
-            requests.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": chat_id, "text": response_text},
-                timeout=20,
-            )
+            self._admin_send_text(chat_id, f"Bot: {'ENABLED' if new_state else 'DISABLED'}")
         elif data == "admin_broadcast":
             self.admin_pending_broadcast = True
-            response_text = "Send your broadcast message now."
-            requests.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": chat_id, "text": response_text},
-                timeout=20,
-            )
+            self._admin_send_text(chat_id, "Send your broadcast message now.")
         elif data == "admin_toggle_vip":
             v = self._run_async_task(self.trade_manager.get_setting("CHANNEL_VIP_ACTIVE", "true")).lower() == "true"
             self._run_async_task(self.trade_manager.set_setting("CHANNEL_VIP_ACTIVE", "false" if v else "true"))
-            requests.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": chat_id, "text": f"VIP channel {'OFF' if v else 'ON'}"},
-                timeout=20,
-            )
+            self._admin_send_text(chat_id, f"VIP channel {'OFF' if v else 'ON'}")
             self.send_admin_dashboard()
         elif data == "admin_toggle_vip_plus":
             v = self._run_async_task(self.trade_manager.get_setting("CHANNEL_VIP_PLUS_ACTIVE", "true")).lower() == "true"
             self._run_async_task(self.trade_manager.set_setting("CHANNEL_VIP_PLUS_ACTIVE", "false" if v else "true"))
-            requests.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": chat_id, "text": f"VIP+ channel {'OFF' if v else 'ON'}"},
-                timeout=20,
-            )
+            self._admin_send_text(chat_id, f"VIP+ channel {'OFF' if v else 'ON'}")
             self.send_admin_dashboard()
         elif data == "admin_toggle_daily":
             v = self._run_async_task(self.trade_manager.get_setting("DAILY_SUMMARY_ACTIVE", "true")).lower() == "true"
             self._run_async_task(self.trade_manager.set_setting("DAILY_SUMMARY_ACTIVE", "false" if v else "true"))
-            requests.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": chat_id, "text": f"Daily report {'OFF' if v else 'ON'}"},
-                timeout=20,
-            )
+            self._admin_send_text(chat_id, f"Daily report {'OFF' if v else 'ON'}")
             self.send_admin_dashboard()
         elif data == "admin_toggle_target":
             v = self._run_async_task(self.trade_manager.get_setting("TARGET_REPLY_ACTIVE", "true")).lower() == "true"
             self._run_async_task(self.trade_manager.set_setting("TARGET_REPLY_ACTIVE", "false" if v else "true"))
-            requests.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": chat_id, "text": f"Target replies {'OFF' if v else 'ON'}"},
-                timeout=20,
-            )
+            self._admin_send_text(chat_id, f"Target replies {'OFF' if v else 'ON'}")
             self.send_admin_dashboard()
         elif data == "admin_test_vip":
-            requests.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": str(self.chat_id), "text": "Admin VIP test ping"},
-                timeout=20,
-            )
-            requests.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": chat_id, "text": "VIP test sent"},
-                timeout=20,
-            )
+            self._admin_send_text(str(self.chat_id), "Admin VIP test ping")
+            self._admin_send_text(chat_id, "VIP test sent")
         elif data == "admin_test_vip_plus":
-            requests.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": str(self.vip_plus_chat_id), "text": "Admin VIP+ test ping"},
-                timeout=20,
-            )
-            requests.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": chat_id, "text": "VIP+ test sent"},
-                timeout=20,
-            )
+            self._admin_send_text(str(self.vip_plus_chat_id), "Admin VIP+ test ping")
+            self._admin_send_text(chat_id, "VIP+ test sent")
         elif data == "admin_send_daily_now":
             day = datetime.now(UTC).strftime("%Y-%m-%d")
             self.send_daily_performance_report(day)
-            requests.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": chat_id, "text": "Daily report sent"},
-                timeout=20,
-            )
+            self._admin_send_text(chat_id, "Daily report sent")
 
         if callback_id:
             try:
@@ -1345,11 +1296,7 @@ class FortressScanner:
             except Exception as exc:
                 print(f"[TG] broadcast send failed chat={chat} err={exc}")
                 continue
-        requests.post(
-            f"https://api.telegram.org/bot{self.token}/sendMessage",
-            json={"chat_id": str(self.admin_user_id), "text": f"Broadcast delivered to {sent} chats."},
-            timeout=20,
-        )
+        self._admin_send_text(str(self.admin_user_id), f"Broadcast delivered to {sent} chats.")
 
     def admin_interface_loop(self) -> None:
         if not self.token:
@@ -1855,7 +1802,7 @@ class FortressScanner:
         entries: List[str] = []
         total_hits = 0
         total_missed = 0
-        for timestamp, exchange_name, symbol, side, entry_price, status, last_target_hit in rows:
+        for _timestamp, exchange_name, symbol, side, entry_price, status, last_target_hit in rows:
             coin = str(symbol).replace("/USDT", "")
             result = self.evaluate_signal_result(
                 exchange_name=exchange_name,
@@ -2182,7 +2129,7 @@ class FortressScanner:
         for i in range(len(df_15m) - 4, 3, -1):
             o = float(df_15m.iloc[i]["open"])
             h = float(df_15m.iloc[i]["high"])
-            l = float(df_15m.iloc[i]["low"])
+            low_v = float(df_15m.iloc[i]["low"])
             c = float(df_15m.iloc[i]["close"])
             next_close = float(df_15m.iloc[i + 1]["close"])
             next2_high = float(df_15m.iloc[i + 2]["high"])
@@ -2194,12 +2141,12 @@ class FortressScanner:
                 bearish_base = c < o
                 upside_bos = next_close > prev_high and next2_high > h
                 if bearish_base and upside_bos:
-                    return (l, h)
+                    return (low_v, h)
             else:
                 bullish_base = c > o
-                downside_bos = next_close < prev_low and next2_low < l
+                downside_bos = next_close < prev_low and next2_low < low_v
                 if bullish_base and downside_bos:
-                    return (l, h)
+                    return (low_v, h)
 
         return None
 
@@ -2276,7 +2223,6 @@ class FortressScanner:
                 btc = self.add_indicators(btc)
                 eth = self.add_indicators(eth)
                 btc_last = btc.iloc[-1]
-                eth_last = eth.iloc[-1]
                 btc_resistance = float(btc_last["close"]) >= float(btc["high"].iloc[-30:].max()) * 0.998
                 btc_bear_div = (
                     float(btc.iloc[-1]["close"]) > float(btc.iloc[-5]["close"])
@@ -2641,81 +2587,6 @@ class FortressScanner:
             "social_galaxy_score": float(layer8.get("galaxy_score", 0.0)),
             "social_alt_rank": int(layer8.get("alt_rank", 0)),
         }
-
-    def run_vip_plus_layer_test(self, symbols: List[str], exchange_name: str = "Binance") -> None:
-        ex = self.exchanges.get(exchange_name)
-        if not ex:
-            print(f"[DEV-VIP+] exchange unavailable: {exchange_name}")
-            return
-        for symbol in symbols:
-            print(f"\n[DEV-VIP+] {symbol} ({exchange_name})")
-            try:
-                dfs = self.fetch_multi_timeframes(ex, symbol)
-                if not dfs:
-                    print("[DEV-VIP+] FAIL | data fetch failed")
-                    continue
-                d4h = self.add_indicators(dfs["4h"])
-                d1h = self.add_indicators(dfs["1h"])
-                d15 = self.add_indicators(dfs["15m"])
-                d5 = self.add_indicators(dfs["5m"])
-                if d4h.iloc[-1].isna().any() or d1h.iloc[-1].isna().any() or d15.iloc[-1].isna().any() or d5.iloc[-1].isna().any():
-                    print("[DEV-VIP+] FAIL | indicator NaN")
-                    continue
-                price = float(d5.iloc[-1]["close"])
-                trend_up = float(d4h.iloc[-1]["close"]) > float(d4h.iloc[-1]["ema200"])
-                trend_down = float(d4h.iloc[-1]["close"]) < float(d4h.iloc[-1]["ema200"])
-                bos_up = float(d15.iloc[-1]["close"]) > max(float(d15.iloc[-2]["high"]), float(d15.iloc[-3]["high"]))
-                bos_down = float(d15.iloc[-1]["close"]) < min(float(d15.iloc[-2]["low"]), float(d15.iloc[-3]["low"]))
-                side = "LONG" if (trend_up or bos_up) else "SHORT"
-                if trend_down and bos_down:
-                    side = "SHORT"
-                demand_zone = self.find_last_order_block_before_bos(d15, "LONG")
-                supply_zone = self.find_last_order_block_before_bos(d15, "SHORT")
-                in_demand_zone = bool(demand_zone and demand_zone[0] <= price <= demand_zone[1] * 1.002)
-                in_supply_zone = bool(supply_zone and supply_zone[0] * 0.998 <= price <= supply_zone[1])
-                long_fvg = self.find_latest_fvg(d15, "LONG")
-                short_fvg = self.find_latest_fvg(d15, "SHORT")
-                long_fvg_eq_retested = bool(long_fvg and long_fvg[0] <= price <= long_fvg[1] and price <= long_fvg[2])
-                short_fvg_eq_retested = bool(short_fvg and short_fvg[0] <= price <= short_fvg[1] and price >= short_fvg[2])
-                avg_volume = float(d5.iloc[-1]["vol_sma20"]) if float(d5.iloc[-1]["vol_sma20"]) > 0 else 0.0
-                current_volume = float(d5.iloc[-1]["volume"])
-                volume_spike = avg_volume > 0 and current_volume > (avg_volume * 1.5)
-                atr = float(d5.iloc[-1]["atr"])
-                if atr <= 0:
-                    print("[DEV-VIP+] FAIL | ATR unavailable")
-                    continue
-                entry = price
-                sl = entry - (1.5 * atr) if side == "LONG" else entry + (1.5 * atr)
-                layered = self._run_async_task(
-                    asyncio.wait_for(
-                        self.evaluate_layer_stack(
-                            ex=ex,
-                            symbol=symbol,
-                            side=side,
-                            d5=d5,
-                            d15=d15,
-                            entry=entry,
-                            sl=sl,
-                            current_price=price,
-                            volume_spike=volume_spike,
-                            in_demand_zone=in_demand_zone,
-                            in_supply_zone=in_supply_zone,
-                            long_fvg_eq_retested=long_fvg_eq_retested,
-                            short_fvg_eq_retested=short_fvg_eq_retested,
-                        ),
-                        timeout=max(0.5, self.layer_timeout_ms / 1000.0),
-                    )
-                )
-                lines = layered.get("vip_plus_layer_lines", [])
-                for ln in lines:
-                    print(f"[DEV-VIP+]   {ln}")
-                if layered.get("vip_plus_ok"):
-                    print("[DEV-VIP+] result=PASS (layers 1-8)")
-                else:
-                    fail_line = next((ln for ln in lines if "FAIL" in ln), "Unknown fail layer")
-                    print(f"[DEV-VIP+] result=REJECT first_fail={fail_line}")
-            except Exception as exc:
-                print(f"[DEV-VIP+] FAIL | error={repr(exc)}")
 
     @staticmethod
     def analyze_order_book_depth(
@@ -3169,8 +3040,7 @@ class FortressScanner:
             if not macro["sector_strength_ok"]:
                 return None
 
-        # Beta filter and score boost.
-        beta = macro["beta_vs_btc"]
+        # Relative performance vs BTC (score boost / short filter).
         btc_change = macro["btc_change_pct"]
         asset_change = macro["asset_change_pct"]
         if side == "LONG":
@@ -3660,10 +3530,10 @@ class FortressScanner:
             for i, candle in enumerate(ohlc):
                 o = candle["open"]
                 h = candle["high"]
-                l = candle["low"]
+                low_px = candle["low"]
                 c = candle["close"]
                 color = bull_color if c >= o else bear_color
-                ax.plot([i, i], [l, h], color=color, linewidth=1.25, solid_capstyle="round")
+                ax.plot([i, i], [low_px, h], color=color, linewidth=1.25, solid_capstyle="round")
                 body_low = min(o, c)
                 body_height = max(abs(c - o), 1e-9)
                 rect = plt.Rectangle(
@@ -3714,8 +3584,12 @@ class FortressScanner:
             trend_y1 = min(lows[-10:]) if len(ohlc) >= 10 else lows[-1]
             ax.plot([x0, x1], [trend_y0, trend_y1], color="#a78bfa", linewidth=1.2, alpha=0.9)
 
-            # Liquidity sweep marker: long wick extremes near the edge.
-            sweep_idx = max(range(len(ohlc) - 12, len(ohlc)), key=lambda i: abs(ohlc[i]["high"] - ohlc[i]["low"]))
+            # Liquidity sweep marker: long wick extremes over the last N candles.
+            sweep_start = max(0, len(ohlc) - 12)
+            sweep_idx = max(
+                range(sweep_start, len(ohlc)),
+                key=lambda i: abs(ohlc[i]["high"] - ohlc[i]["low"]),
+            )
             ax.scatter([sweep_idx], [ohlc[sweep_idx]["high"]], color="#f97316", s=30, zorder=5)
             ax.text(sweep_idx, ohlc[sweep_idx]["high"], "Sweep", color="#f97316", fontsize=7, va="bottom")
 
@@ -3797,8 +3671,8 @@ class FortressScanner:
                                     last_price=float(live_price),
                                 )
                             )
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            print(f"[EXEC] failed to mark signal {setup.get('signal_id')} expired: {exc}")
                     return
         self._refresh_daily_flow_state()
         now_il = datetime.now(self.il_tz)
@@ -3826,7 +3700,6 @@ class FortressScanner:
                 )
                 return
 
-        url = f"https://api.telegram.org/bot{self.vip_token}/sendMessage"
         try:
             signal_id_opt: Optional[int] = None
             try:
@@ -3839,7 +3712,6 @@ class FortressScanner:
             stop_pct = abs((setup["entry"] - setup["sl"]) / max(setup["entry"], 1e-9)) * 100
             signal_strength = max(80, min(99, int(setup["score"] * 10)))
             rr_text = f"1:{setup['rr']:.2f}"
-            rel_vol = float(setup["rel_volume"])
             tech_blocks = self.build_technical_analysis_blocks(symbol=symbol, side_caps=side_caps, setup=setup)
             leverage = setup.get("leverage", "x10")
             entry_text = f"${setup['entry']:,.2f}"
@@ -4166,8 +4038,10 @@ class FortressScanner:
             if self._run_async_task(self.trade_manager.is_pair_blacklisted(symbol)):
                 print(f"[QUALITY] skipped {exchange_name} {symbol} (blacklisted 24h)")
                 return
-        except Exception:
-            pass
+        except Exception as exc:
+            # Fail-open on blacklist gate (DB hiccup) but log it — silent failure here
+            # could let a blacklisted pair through unnoticed.
+            print(f"[QUALITY] blacklist check unavailable for {exchange_name} {symbol}: {exc}")
         try:
             if self._run_async_task(
                 self.trade_manager.is_symbol_on_cooldown(exchange_name=exchange_name, symbol=symbol)
