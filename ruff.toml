@@ -1,0 +1,12 @@
+# Ruff config — project sources only (.venv excluded by default when invoking from repo root).
+target-version = "py312"
+line-length = 120
+
+[lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
+
+[lint.per-file-ignores]
+# Warning filters must run before pandas / pandas_ta imports; E402 is intentional here.
+# Import blocks are split deliberately (stdlib / third-party) around warning filters.
+"scanner.py" = ["E402", "I001"]

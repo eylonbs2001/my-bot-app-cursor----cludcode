@@ -34,7 +34,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Run as non-root user — basic hardening.
 RUN useradd --create-home --shell /usr/sbin/nologin falcon \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tzdata curl \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata curl tini \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -51,6 +51,5 @@ HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
 
 USER falcon
 
-# The scanner blocks the main thread with run_forever(); no signal handling
-# is wired up explicitly so use SIGTERM-friendly exec form via tini.
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python", "-u", "scanner.py"]
