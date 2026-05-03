@@ -57,8 +57,9 @@ class TradeManager:
         )
         self.pg_host = os.getenv("POSTGRES_HOST", "fortress-postgres")
         self.pg_port = int(os.getenv("POSTGRES_PORT", "5432"))
-        self.pg_user = os.getenv("POSTGRES_USER", "fortress")
-        self.pg_password = os.getenv("POSTGRES_PASSWORD", "fortress")
+        # Prefer DATABASE_URL/DB_URL (above); discrete vars are for local/docker only.
+        self.pg_user = os.getenv("POSTGRES_USER", "falcon_admin")
+        self.pg_password = os.getenv("POSTGRES_PASSWORD", "").strip()
         self.pg_database = os.getenv("POSTGRES_DB", "trading_db")
         self.redis_url = (
             os.getenv("REDIS_URL")
@@ -86,6 +87,15 @@ class TradeManager:
         if self.db_url:
             print("[POSTGRES] connecting via DATABASE_URL/DB_URL (dsn)")
         else:
+            print(
+                "[POSTGRES] DATABASE_URL/DB_URL not set — using POSTGRES_* "
+                "(set DATABASE_URL in production to avoid auth mismatch)"
+            )
+            if not self.pg_password:
+                raise RuntimeError(
+                    "Postgres: set DATABASE_URL/DB_URL, or set POSTGRES_PASSWORD "
+                    "when using discrete POSTGRES_HOST/POSTGRES_USER."
+                )
             print(
                 f"[POSTGRES] connecting host={self.pg_host} port={self.pg_port} "
                 f"db={self.pg_database} user={self.pg_user}"

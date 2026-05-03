@@ -3,7 +3,7 @@
 # Architecture:
 #   - bot      → the FortressScanner Python service (built from Dockerfile)
 #   - redis    → local Redis 7 in a docker container, only reachable from bot
-#   - Postgres → REMOTE on Railway, addressed via DATABASE_URL in .env
+#   - Postgres → REMOTE (Railway, etc.): set DATABASE_URL in .env (preferred over POSTGRES_*).
 #
 # Bring up with:
 #   docker compose -f docker-compose.prod.yml up -d --build

@@ -42,11 +42,16 @@ async def open_db() -> asyncpg.Connection:
     db_url = (os.getenv("DATABASE_URL") or os.getenv("DB_URL") or "").strip()
     if db_url:
         return await asyncpg.connect(dsn=db_url)
+    password = (os.getenv("POSTGRES_PASSWORD") or "").strip()
+    if not password:
+        raise RuntimeError(
+            "Set DATABASE_URL/DB_URL or POSTGRES_PASSWORD when using discrete POSTGRES_*."
+        )
     return await asyncpg.connect(
         host=os.getenv("POSTGRES_HOST", "localhost"),
         port=int(os.getenv("POSTGRES_PORT", "5432")),
-        user=os.getenv("POSTGRES_USER", "fortress"),
-        password=os.getenv("POSTGRES_PASSWORD", "fortress"),
+        user=os.getenv("POSTGRES_USER", "falcon_admin"),
+        password=password,
         database=os.getenv("POSTGRES_DB", "trading_db"),
     )
 
