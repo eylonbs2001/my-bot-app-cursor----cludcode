@@ -3,11 +3,54 @@ import asyncio
 import io
 import os
 from datetime import UTC, datetime
+from typing import Any, Dict
+from urllib.parse import parse_qs, unquote, urlparse
 
 import asyncpg
 import matplotlib.pyplot as plt
 import requests
 from dotenv import load_dotenv
+
+
+def _urlparse_database_url(db_url: str) -> Any:
+    s = db_url.strip()
+    if s.startswith("postgres://"):
+        s = "postgresql://" + s[len("postgres://") :]
+    return urlparse(s)
+
+
+def _asyncpg_ssl_kwarg(parsed: Any) -> Any:
+    qs = parse_qs(parsed.query)
+    mode = (qs.get("sslmode") or [""])[0].lower()
+    if mode in ("require", "verify-ca", "verify-full"):
+        return True
+    if (qs.get("ssl") or [""])[0].lower() in ("1", "true", "on"):
+        return True
+    return None
+
+
+def _pg_connect_kwargs_placeholder_user_dsn(
+    db_url: str, pg_user: str, pg_password_env: str
+) -> Dict[str, Any]:
+    parsed = _urlparse_database_url(db_url)
+    password = (pg_password_env or "").strip() or unquote(parsed.password or "")
+    if not password:
+        raise RuntimeError(
+            "Postgres: DATABASE_URL username is placeholder 'user'. Set POSTGRES_PASSWORD "
+            "or fix DATABASE_URL with the correct user."
+        )
+    path = (parsed.path or "").lstrip("/")
+    kwargs: Dict[str, Any] = {
+        "host": parsed.hostname or "localhost",
+        "port": parsed.port or 5432,
+        "user": pg_user,
+        "password": password,
+        "database": path or "postgres",
+    }
+    ssl_arg = _asyncpg_ssl_kwarg(parsed)
+    if ssl_arg is not None:
+        kwargs["ssl"] = ssl_arg
+    return kwargs
 
 
 def mdv2_code(value: str) -> str:
@@ -40,9 +83,16 @@ def format_elapsed(ts: datetime, now: datetime | None = None) -> str:
 
 async def open_db() -> asyncpg.Connection:
     db_url = (os.getenv("DATABASE_URL") or os.getenv("DB_URL") or "").strip()
+    pg_user = os.getenv("POSTGRES_USER", "falcon_admin")
+    pg_password = (os.getenv("POSTGRES_PASSWORD") or "").strip()
     if db_url:
+        parsed = _urlparse_database_url(db_url)
+        url_user = unquote(parsed.username or "")
+        if url_user == "user" and pg_user != "user":
+            kw = _pg_connect_kwargs_placeholder_user_dsn(db_url, pg_user, pg_password)
+            return await asyncpg.connect(**kw)
         return await asyncpg.connect(dsn=db_url)
-    password = (os.getenv("POSTGRES_PASSWORD") or "").strip()
+    password = pg_password
     if not password:
         raise RuntimeError(
             "Set DATABASE_URL/DB_URL or POSTGRES_PASSWORD when using discrete POSTGRES_*."
@@ -50,7 +100,7 @@ async def open_db() -> asyncpg.Connection:
     return await asyncpg.connect(
         host=os.getenv("POSTGRES_HOST", "localhost"),
         port=int(os.getenv("POSTGRES_PORT", "5432")),
-        user=os.getenv("POSTGRES_USER", "falcon_admin"),
+        user=pg_user,
         password=password,
         database=os.getenv("POSTGRES_DB", "trading_db"),
     )

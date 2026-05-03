@@ -13,6 +13,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, date, datetime
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, unquote, urlparse
 from zoneinfo import ZoneInfo
 
 # IMPORTANT: warning suppression must be installed BEFORE pandas / pandas_ta /
@@ -45,6 +46,49 @@ except Exception:
     import pandas_ta as ta
 
 load_dotenv()
+
+
+def _urlparse_database_url(db_url: str) -> Any:
+    s = db_url.strip()
+    if s.startswith("postgres://"):
+        s = "postgresql://" + s[len("postgres://") :]
+    return urlparse(s)
+
+
+def _asyncpg_ssl_kwarg(parsed: Any) -> Any:
+    """Map sslmode / ssl query params from a DSN into asyncpg's ssl= argument."""
+    qs = parse_qs(parsed.query)
+    mode = (qs.get("sslmode") or [""])[0].lower()
+    if mode in ("require", "verify-ca", "verify-full"):
+        return True
+    if (qs.get("ssl") or [""])[0].lower() in ("1", "true", "on"):
+        return True
+    return None
+
+
+def _pg_connect_kwargs_placeholder_user_dsn(
+    db_url: str, pg_user: str, pg_password_env: str
+) -> Dict[str, Any]:
+    """When DATABASE_URL uses the literal username `user`, connect as pg_user instead."""
+    parsed = _urlparse_database_url(db_url)
+    password = (pg_password_env or "").strip() or unquote(parsed.password or "")
+    if not password:
+        raise RuntimeError(
+            "Postgres: DATABASE_URL username is placeholder 'user'. Set POSTGRES_PASSWORD "
+            "to the real role's password, or fix DATABASE_URL with the correct user."
+        )
+    path = (parsed.path or "").lstrip("/")
+    kwargs: Dict[str, Any] = {
+        "host": parsed.hostname or "localhost",
+        "port": parsed.port or 5432,
+        "user": pg_user,
+        "password": password,
+        "database": path or "postgres",
+    }
+    ssl_arg = _asyncpg_ssl_kwarg(parsed)
+    if ssl_arg is not None:
+        kwargs["ssl"] = ssl_arg
+    return kwargs
 
 
 class TradeManager:
@@ -84,8 +128,35 @@ class TradeManager:
         self.redis: Optional[redis_async.Redis] = None
 
     async def startup(self) -> List[dict]:
+        # Pool config tuned for managed Postgres (Railway, Supabase, RDS) which
+        # silently drop idle connections. max_inactive_connection_lifetime
+        # forces asyncpg to retire connections before the server kills them
+        # (avoiding 'SSL error: unexpected eof while reading').
+        # command_timeout caps slow queries so a network hiccup can't hang the loop.
+        pool_kwargs = dict(
+            min_size=1,
+            max_size=10,
+            max_inactive_connection_lifetime=180.0,  # recycle every 3 min
+            command_timeout=30.0,
+            server_settings={"application_name": "falconeye_scanner"},
+        )
         if self.db_url:
-            print("[POSTGRES] connecting via DATABASE_URL/DB_URL (dsn)")
+            parsed = _urlparse_database_url(self.db_url)
+            url_user = unquote(parsed.username or "")
+            # Many templates use postgresql://user:...@host — that literal role breaks
+            # when the real Postgres user is falcon_admin (POSTGRES_USER / default).
+            if url_user == "user" and self.pg_user != "user":
+                print(
+                    f"[POSTGRES] DATABASE_URL uses placeholder user 'user'; "
+                    f"connecting as '{self.pg_user}' (host/db/ssl from URL)"
+                )
+                conn_kw = _pg_connect_kwargs_placeholder_user_dsn(
+                    self.db_url, self.pg_user, self.pg_password
+                )
+                self.pool = await asyncpg.create_pool(**conn_kw, **pool_kwargs)
+            else:
+                print("[POSTGRES] connecting via DATABASE_URL/DB_URL (dsn)")
+                self.pool = await asyncpg.create_pool(dsn=self.db_url, **pool_kwargs)
         else:
             print(
                 "[POSTGRES] DATABASE_URL/DB_URL not set — using POSTGRES_* "
@@ -100,21 +171,6 @@ class TradeManager:
                 f"[POSTGRES] connecting host={self.pg_host} port={self.pg_port} "
                 f"db={self.pg_database} user={self.pg_user}"
             )
-        # Pool config tuned for managed Postgres (Railway, Supabase, RDS) which
-        # silently drop idle connections. max_inactive_connection_lifetime
-        # forces asyncpg to retire connections before the server kills them
-        # (avoiding 'SSL error: unexpected eof while reading').
-        # command_timeout caps slow queries so a network hiccup can't hang the loop.
-        pool_kwargs = dict(
-            min_size=1,
-            max_size=10,
-            max_inactive_connection_lifetime=180.0,  # recycle every 3 min
-            command_timeout=30.0,
-            server_settings={"application_name": "falconeye_scanner"},
-        )
-        if self.db_url:
-            self.pool = await asyncpg.create_pool(dsn=self.db_url, **pool_kwargs)
-        else:
             self.pool = await asyncpg.create_pool(
                 host=self.pg_host,
                 port=self.pg_port,
