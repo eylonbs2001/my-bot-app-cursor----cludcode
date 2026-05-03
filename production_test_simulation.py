@@ -87,9 +87,22 @@ async def open_db() -> asyncpg.Connection:
     pg_password = (os.getenv("POSTGRES_PASSWORD") or "").strip()
     if db_url:
         parsed = _urlparse_database_url(db_url)
-        url_user = unquote(parsed.username or "")
-        if url_user == "user" and pg_user != "user":
-            kw = _pg_connect_kwargs_placeholder_user_dsn(db_url, pg_user, pg_password)
+        url_user = unquote(parsed.username or "").lower()
+        skip_remap = os.getenv("SKIP_DSN_USER_REMAP", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if url_user == "user" and not skip_remap:
+            env_u = (os.getenv("POSTGRES_USER") or "").strip()
+            effective = (
+                env_u
+                if env_u and env_u.lower() != "user"
+                else "falcon_admin"
+            )
+            kw = _pg_connect_kwargs_placeholder_user_dsn(
+                db_url, effective, pg_password
+            )
             return await asyncpg.connect(**kw)
         return await asyncpg.connect(dsn=db_url)
     password = pg_password

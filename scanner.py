@@ -91,6 +91,14 @@ def _pg_connect_kwargs_placeholder_user_dsn(
     return kwargs
 
 
+def _effective_pg_role_for_placeholder_user_dsn() -> str:
+    """When DSN username is the template `user`, use a real Postgres role."""
+    env_u = (os.getenv("POSTGRES_USER") or "").strip()
+    if env_u and env_u.lower() != "user":
+        return env_u
+    return "falcon_admin"
+
+
 class TradeManager:
     """Async Postgres + Redis trade persistence layer."""
 
@@ -142,16 +150,23 @@ class TradeManager:
         )
         if self.db_url:
             parsed = _urlparse_database_url(self.db_url)
-            url_user = unquote(parsed.username or "")
-            # Many templates use postgresql://user:...@host — that literal role breaks
-            # when the real Postgres user is falcon_admin (POSTGRES_USER / default).
-            if url_user == "user" and self.pg_user != "user":
+            url_user = unquote(parsed.username or "").lower()
+            skip_remap = os.getenv("SKIP_DSN_USER_REMAP", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            # Templates and .env often set both DATABASE_URL=user:...@ and POSTGRES_USER=user;
+            # Postgres role is usually falcon_admin — remap unless explicitly skipped.
+            if url_user == "user" and not skip_remap:
+                effective_user = _effective_pg_role_for_placeholder_user_dsn()
                 print(
-                    f"[POSTGRES] DATABASE_URL uses placeholder user 'user'; "
-                    f"connecting as '{self.pg_user}' (host/db/ssl from URL)"
+                    f"[POSTGRES] DATABASE_URL username is placeholder 'user'; "
+                    f"connecting as '{effective_user}' (host/db/ssl from URL). "
+                    f"Set SKIP_DSN_USER_REMAP=1 if your real DB role is literally named user."
                 )
                 conn_kw = _pg_connect_kwargs_placeholder_user_dsn(
-                    self.db_url, self.pg_user, self.pg_password
+                    self.db_url, effective_user, self.pg_password
                 )
                 self.pool = await asyncpg.create_pool(**conn_kw, **pool_kwargs)
             else:
